@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:io';
 import 'dart:convert';
 
@@ -10,6 +11,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:confetti/confetti.dart';
 import 'package:lottie/lottie.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -309,6 +311,7 @@ class Employee {
     required this.salary,
     required this.advance,
     required this.pf,
+    this.dob,
   });
 
   final int id;
@@ -333,6 +336,7 @@ class Employee {
   final int? salary;
   final int? advance;
   final int? pf;
+  final DateTime? dob;
 
   bool get hasPhoto => photo.trim().isNotEmpty || photoUrl.trim().isNotEmpty;
 
@@ -396,6 +400,9 @@ class Employee {
       salary: parseNullableInt(json['salary']),
       advance: parseNullableInt(json['advance']),
       pf: parseNullableInt(json['pf']),
+      dob: json['dateOfBirth'] != null
+          ? DateTime.tryParse(json['dateOfBirth'].toString())
+          : null,
     );
   }
 
@@ -422,6 +429,7 @@ class Employee {
     int? salary,
     int? advance,
     int? pf,
+    DateTime? dob,
   }) {
     return Employee(
       id: id ?? this.id,
@@ -446,6 +454,7 @@ class Employee {
       salary: salary ?? this.salary,
       advance: advance ?? this.advance,
       pf: pf ?? this.pf,
+      dob: dob ?? this.dob,
     );
   }
 }
@@ -1049,7 +1058,20 @@ class EmployeeApiClient {
     required String address,
     required String gender,
     required String maritalStatus,
+    DateTime? dob,
   }) async {
+    final body = <String, dynamic>{
+      'name': name,
+      'contact': contact,
+      'mailId': mailId,
+      'address': address,
+      'gender': gender,
+      'maritalStatus': maritalStatus,
+    };
+    if (dob != null) {
+      body['dateOfBirth'] =
+          '${dob.year.toString().padLeft(4, '0')}-${dob.month.toString().padLeft(2, '0')}-${dob.day.toString().padLeft(2, '0')}';
+    }
     final response = await http.post(
       Uri.parse('${ApiConfig.baseUrl}/employee/profile'),
       headers: {
@@ -1057,14 +1079,7 @@ class EmployeeApiClient {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer $token',
       },
-      body: jsonEncode({
-        'name': name,
-        'contact': contact,
-        'mailId': mailId,
-        'address': address,
-        'gender': gender,
-        'maritalStatus': maritalStatus,
-      }),
+      body: jsonEncode(body),
     );
 
     final payload = _decodePayload(response);
@@ -3164,7 +3179,7 @@ class _AttendancePanel extends StatelessWidget {
   }
 }
 
-class DashboardScreen extends StatelessWidget {
+class DashboardScreen extends StatefulWidget {
   const DashboardScreen({
     super.key,
     required this.employee,
@@ -3179,8 +3194,44 @@ class DashboardScreen extends StatelessWidget {
   final ValueChanged<Employee> onEmployeeUpdated;
 
   @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  late final ConfettiController _confettiLeft;
+  late final ConfettiController _confettiRight;
+
+  bool get _isBirthday {
+    final dob = widget.employee.dob;
+    if (dob == null) return false;
+    final now = DateTime.now();
+    return dob.month == now.month && dob.day == now.day;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _confettiLeft = ConfettiController(duration: const Duration(seconds: 6));
+    _confettiRight = ConfettiController(duration: const Duration(seconds: 6));
+    if (_isBirthday) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _confettiLeft.play();
+        _confettiRight.play();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _confettiLeft.dispose();
+    _confettiRight.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final employee = widget.employee;
     final shortcuts = [
       DashboardShortcut(
         title: 'My Attendance',
@@ -3190,8 +3241,8 @@ class DashboardScreen extends StatelessWidget {
           Navigator.of(context).push(
             MaterialPageRoute<void>(
               builder: (_) => MyAttendancePage(
-                employee: employee,
-                token: token,
+                employee: widget.employee,
+                token: widget.token,
                 apiClient: const EmployeeApiClient(),
               ),
             ),
@@ -3206,8 +3257,8 @@ class DashboardScreen extends StatelessWidget {
           Navigator.of(context).push(
             MaterialPageRoute<void>(
               builder: (_) => ReportsPage(
-                employee: employee,
-                token: token,
+                employee: widget.employee,
+                token: widget.token,
                 apiClient: const EmployeeApiClient(),
               ),
             ),
@@ -3222,8 +3273,8 @@ class DashboardScreen extends StatelessWidget {
           Navigator.of(context).push(
             MaterialPageRoute<void>(
               builder: (_) => SalaryPage(
-                employee: employee,
-                token: token,
+                employee: widget.employee,
+                token: widget.token,
                 apiClient: const EmployeeApiClient(),
               ),
             ),
@@ -3238,7 +3289,7 @@ class DashboardScreen extends StatelessWidget {
           Navigator.of(context).push(
             MaterialPageRoute<void>(
               builder: (_) => LeaveRequestPage(
-                token: token,
+                token: widget.token,
                 apiClient: const EmployeeApiClient(),
               ),
             ),
@@ -3253,8 +3304,8 @@ class DashboardScreen extends StatelessWidget {
           Navigator.of(context).push(
             MaterialPageRoute<void>(
               builder: (_) => SiteVisitRequestPage(
-                employee: employee,
-                token: token,
+                employee: widget.employee,
+                token: widget.token,
                 apiClient: const EmployeeApiClient(),
               ),
             ),
@@ -3270,15 +3321,15 @@ class DashboardScreen extends StatelessWidget {
               .push<Employee>(
                 MaterialPageRoute<Employee>(
                   builder: (_) => ProfilePage(
-                    employee: employee,
-                    token: token,
+                    employee: widget.employee,
+                    token: widget.token,
                     apiClient: const EmployeeApiClient(),
                   ),
                 ),
               )
               .then((updatedEmployee) {
                 if (updatedEmployee != null) {
-                  onEmployeeUpdated(updatedEmployee);
+                  widget.onEmployeeUpdated(updatedEmployee);
                 }
               });
         },
@@ -3286,44 +3337,46 @@ class DashboardScreen extends StatelessWidget {
     ];
 
     return Scaffold(
-      body: SafeArea(
-        child: CustomScrollView(
-          slivers: [
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
+      body: Stack(
+        children: [
+          SafeArea(
+            child: CustomScrollView(
+              slivers: [
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _EmployeeAvatar(
-                          employee: employee,
-                          size: 54,
-                          textStyle: theme.textTheme.titleLarge?.copyWith(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        const SizedBox(width: 14),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                employee.name,
-                                style: theme.textTheme.headlineMedium?.copyWith(
-                                  color: AppColors.text,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
+                        Row(
+                          children: [
+                            _EmployeeAvatar(
+                              employee: employee,
+                              size: 54,
+                              textStyle: theme.textTheme.titleLarge?.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w800,
                               ),
-                              Text(
-                                'Emp ID: ${employee.empId}',
-                                style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: AppColors.subtleText,
-                                ),
+                            ),
+                            const SizedBox(width: 14),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    employee.name,
+                                    style: theme.textTheme.headlineMedium?.copyWith(
+                                      color: AppColors.text,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  Text(
+                                    'Emp ID: ${employee.empId}',
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      color: AppColors.subtleText,
+                                    ),
                               ),
                               Text(
                                 'Branch ID: ${employee.branchId} • ${employee.branchName.isNotEmpty ? employee.branchName : 'Branch name unavailable'}',
@@ -3337,11 +3390,53 @@ class DashboardScreen extends StatelessWidget {
                           ),
                         ),
                         IconButton.filledTonal(
-                          onPressed: onLogout,
+                          onPressed: widget.onLogout,
                           icon: const Icon(Icons.logout_rounded),
                         ),
                       ],
                     ),
+                    if (_isBirthday) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                          horizontal: 16,
+                        ),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            colors: [Color(0xFFFFD700), Color(0xFFFF8C00)],
+                          ),
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Text(
+                              '🎂',
+                              style: TextStyle(fontSize: 22),
+                            ),
+                            const SizedBox(width: 8),
+                            Flexible(
+                              child: Text(
+                                'Happy Birthday, ${employee.name.split(' ').first}! 🎉',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            const Text(
+                              '🎂',
+                              style: TextStyle(fontSize: 22),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 8),
                   ],
                 ),
@@ -3363,8 +3458,99 @@ class DashboardScreen extends StatelessWidget {
           ],
         ),
       ),
+          // Confetti — left side shooting bottom-to-top
+          if (_isBirthday)
+            Align(
+              alignment: Alignment.bottomLeft,
+              child: ConfettiWidget(
+                confettiController: _confettiLeft,
+                blastDirection: -1.57, // straight up (π/2 radians upward)
+                emissionFrequency: 0.05,
+                numberOfParticles: 18,
+                maxBlastForce: 50,
+                minBlastForce: 20,
+                gravity: 0.2,
+                particleDrag: 0.05,
+                minimumSize: const Size(10, 10),
+                maximumSize: const Size(20, 20),
+                colors: const [
+                  Colors.purple,
+                  Colors.pink,
+                  Colors.orange,
+                  Colors.yellow,
+                  Colors.blue,
+                  Colors.green,
+                ],
+                createParticlePath: (size) {
+                  final path = Path();
+                  const int points = 5;
+                  final double outerR = size.width / 2;
+                  final double innerR = outerR / 2.5;
+                  for (int i = 0; i < points * 2; i++) {
+                    final double r = i.isEven ? outerR : innerR;
+                    final double angle = (i * math.pi / points) - math.pi / 2;
+                    final double x = outerR + r * math.cos(angle);
+                    final double y = outerR + r * math.sin(angle);
+                    if (i == 0) {
+                      path.moveTo(x, y);
+                    } else {
+                      path.lineTo(x, y);
+                    }
+                  }
+                  path.close();
+                  return path;
+                },
+              ),
+            ),
+          // Confetti — right side shooting bottom-to-top
+          if (_isBirthday)
+            Align(
+              alignment: Alignment.bottomRight,
+              child: ConfettiWidget(
+                confettiController: _confettiRight,
+                blastDirection: -1.57,
+                emissionFrequency: 0.05,
+                numberOfParticles: 18,
+                maxBlastForce: 50,
+                minBlastForce: 20,
+                gravity: 0.2,
+                particleDrag: 0.05,
+                minimumSize: const Size(10, 10),
+                maximumSize: const Size(20, 20),
+                colors: const [
+                  Colors.purple,
+                  Colors.pink,
+                  Colors.orange,
+                  Colors.yellow,
+                  Colors.blue,
+                  Colors.green,
+                ],
+                createParticlePath: (size) {
+                  final path = Path();
+                  const int points = 5;
+                  final double outerR = size.width / 2;
+                  final double innerR = outerR / 2.5;
+                  for (int i = 0; i < points * 2; i++) {
+                    final double r = i.isEven ? outerR : innerR;
+                    final double angle = (i * math.pi / points) - math.pi / 2;
+                    final double x = outerR + r * math.cos(angle);
+                    final double y = outerR + r * math.sin(angle);
+                    if (i == 0) {
+                      path.moveTo(x, y);
+                    } else {
+                      path.lineTo(x, y);
+                    }
+                  }
+                  path.close();
+                  return path;
+                },
+              ),
+            ),
+        ],
+      ),
     );
   }
+
 }
 
 class SalaryPage extends StatefulWidget {
@@ -4671,6 +4857,7 @@ class _ProfilePageState extends State<ProfilePage> {
   bool _isSavingProfile = false;
   String? _selectedGender;
   String? _selectedMaritalStatus;
+  DateTime? _selectedDob;
 
   @override
   void initState() {
@@ -4702,6 +4889,7 @@ class _ProfilePageState extends State<ProfilePage> {
       employee.maritalStatus,
       _maritalStatusOptions,
     );
+    _selectedDob = employee.dob;
   }
 
   void _applyEmployee(Employee employee, {bool syncForm = true}) {
@@ -4872,6 +5060,7 @@ class _ProfilePageState extends State<ProfilePage> {
         address: _addressController.text.trim(),
         gender: (_selectedGender ?? '').trim(),
         maritalStatus: (_selectedMaritalStatus ?? '').trim(),
+        dob: _selectedDob,
       );
 
       if (!mounted) {
@@ -5230,6 +5419,56 @@ class _ProfilePageState extends State<ProfilePage> {
                           ),
                         ),
                       ],
+                    ),
+                    const SizedBox(height: 14),
+                    _LabeledField(
+                      label: 'Date of Birth (optional)',
+                      child: GestureDetector(
+                        onTap: () async {
+                          final now = DateTime.now();
+                          final picked = await showDatePicker(
+                            context: context,
+                            initialDate: _selectedDob ??
+                                DateTime(now.year - 25, now.month, now.day),
+                            firstDate: DateTime(1940),
+                            lastDate: DateTime(
+                              now.year - 16,
+                              now.month,
+                              now.day,
+                            ),
+                          );
+                          if (picked != null) {
+                            setState(() {
+                              _selectedDob = picked;
+                            });
+                          }
+                        },
+                        child: AbsorbPointer(
+                          child: TextFormField(
+                            readOnly: true,
+                            decoration: _fieldDecoration(
+                              hintText: 'Select date of birth',
+                              prefixIcon: Icons.cake_outlined,
+                            ).copyWith(
+                              suffixIcon: _selectedDob != null
+                                  ? IconButton(
+                                      icon: const Icon(Icons.clear, size: 18),
+                                      onPressed: () {
+                                        setState(() {
+                                          _selectedDob = null;
+                                        });
+                                      },
+                                    )
+                                  : null,
+                            ),
+                            controller: TextEditingController(
+                              text: _selectedDob != null
+                                  ? '${_selectedDob!.day.toString().padLeft(2, '0')}/${_selectedDob!.month.toString().padLeft(2, '0')}/${_selectedDob!.year}'
+                                  : '',
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
                     const SizedBox(height: 14),
                     _LabeledField(
