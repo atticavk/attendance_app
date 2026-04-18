@@ -1,22 +1,842 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:ui';
 
 import 'package:camera/camera.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:lottie/lottie.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:timezone/data/latest.dart' as tzdata;
+import 'package:timezone/timezone.dart' as tz;
+import 'package:workmanager/workmanager.dart';
+
+const String _adminNotificationBackgroundTaskName =
+    'adminNotificationBackgroundSync';
+const String _adminNotificationBackgroundPeriodicTaskUniqueName =
+    'adminNotificationBackgroundPeriodicSync';
+const String _adminNotificationBackgroundOneOffTaskUniqueName =
+    'adminNotificationBackgroundOneOffSync';
+
+@pragma('vm:entry-point')
+void adminNotificationBackgroundDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    WidgetsFlutterBinding.ensureInitialized();
+    DartPluginRegistrant.ensureInitialized();
+
+    if (!Platform.isAndroid) {
+      return true;
+    }
+
+    await ApiConfig.load();
+    await AttendanceNotificationService.initializeForBackground();
+
+    if (task == _adminNotificationBackgroundTaskName) {
+      return AdminNotificationBackgroundService.runBackgroundSync();
+    }
+
+    return true;
+  });
+}
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
+  await PushMessagingService.initialize();
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isAndroid) {
+    await Workmanager().initialize(adminNotificationBackgroundDispatcher);
+    await AdminNotificationBackgroundService.cancelAll();
+  }
   await ApiConfig.load();
+  await AttendanceNotificationService.initialize();
+  await PushMessagingService.initialize();
   runApp(const EmployeePortalApp());
+}
+
+class AttendanceNotificationService {
+  AttendanceNotificationService._();
+
+  static final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
+
+  static const String _notificationIcon = 'ic_stat_attica';
+
+  static const int _checkInReminderId = 1009;
+  static const int _logoutReminderId = 1018;
+  static const int _checkInCompletedId = 2009;
+  static const int _checkOutCompletedId = 2018;
+  static const int _adminNotificationBaseId = 300000;
+  static const int _branchOpeningReminderBaseId = 400000;
+  static const int _branchOpeningReminderMaxSlots = 32;
+  static const int _legacyRunningNotificationId = 1000;
+  static const int _legacyBreakReminderId = 1015;
+  static const int _legacyCheckInReminderId = 900;
+  static const int _legacyCheckOutReminderId = 1800;
+  static const String _shownAdminNotificationIdsKey =
+      'shown_admin_notification_delivery_ids_v1';
+  static const String _checkInCompletedDateKey =
+      'attendance_check_in_completed_date';
+  static const String _checkOutCompletedDateKey =
+      'attendance_check_out_completed_date';
+
+  static final NotificationDetails _reminderNotificationDetails =
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          'attendance_reminders',
+          'Attendance reminders',
+          channelDescription: 'Timed check-in and logout reminders',
+          icon: _notificationIcon,
+          importance: Importance.high,
+          priority: Priority.high,
+          ongoing: true,
+          autoCancel: false,
+          onlyAlertOnce: true,
+          additionalFlags: Int32List.fromList([32]),
+        ),
+      );
+
+  static const NotificationDetails _completedNotificationDetails =
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          'attendance_completed',
+          'Attendance completed',
+          channelDescription: 'Attendance completion confirmations',
+          icon: _notificationIcon,
+          importance: Importance.defaultImportance,
+          priority: Priority.defaultPriority,
+          timeoutAfter: 5000,
+          autoCancel: true,
+        ),
+      );
+
+  static const NotificationDetails _adminNotificationDetails =
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          'admin_push_notifications',
+          'Admin notifications',
+          channelDescription: 'Notifications sent by admin',
+          icon: _notificationIcon,
+          importance: Importance.high,
+          priority: Priority.high,
+          autoCancel: true,
+        ),
+      );
+
+  static const NotificationDetails _branchOpeningNotificationDetails =
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          'branch_opening_reminders',
+          'Branch opening reminders',
+          channelDescription: 'Reminders for employees assigned to open branches',
+          icon: _notificationIcon,
+          importance: Importance.high,
+          priority: Priority.high,
+          autoCancel: true,
+        ),
+      );
+
+  static Future<void> initialize() async {
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) {
+      return;
+    }
+
+    await _configureLocalTimezone();
+    await _initializeNotificationsPlugin();
+    await _createNotificationChannels();
+
+    if (Platform.isAndroid) {
+      final androidPlugin = _notifications
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >();
+      final permissionGranted = await androidPlugin
+          ?.requestNotificationsPermission();
+      if (permissionGranted == false) {
+        return;
+      }
+      await _ensureExactAlarmPermission(androidPlugin);
+    }
+
+    await _scheduleDailyReminders();
+  }
+
+  static Future<void> initializeForBackground() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    await _configureLocalTimezone();
+    await _initializeNotificationsPlugin();
+    await _createNotificationChannels();
+  }
+
+  static Future<void> _initializeNotificationsPlugin() async {
+    const initializationSettings = InitializationSettings(
+      android: AndroidInitializationSettings(_notificationIcon),
+      iOS: DarwinInitializationSettings(),
+      macOS: DarwinInitializationSettings(),
+    );
+    await _notifications.initialize(settings: initializationSettings);
+  }
+
+  static Future<void> _createNotificationChannels() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    final androidPlugin = _notifications
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    if (androidPlugin == null) {
+      return;
+    }
+
+    await androidPlugin.createNotificationChannel(
+      const AndroidNotificationChannel(
+        'attendance_reminders',
+        'Attendance reminders',
+        description: 'Timed check-in and logout reminders',
+        importance: Importance.high,
+      ),
+    );
+    await androidPlugin.createNotificationChannel(
+      const AndroidNotificationChannel(
+        'attendance_completed',
+        'Attendance completed',
+        description: 'Attendance completion confirmations',
+        importance: Importance.defaultImportance,
+      ),
+    );
+    await androidPlugin.createNotificationChannel(
+      const AndroidNotificationChannel(
+        'admin_push_notifications',
+        'Admin notifications',
+        description: 'Notifications sent by admin',
+        importance: Importance.high,
+      ),
+    );
+    await androidPlugin.createNotificationChannel(
+      const AndroidNotificationChannel(
+        'branch_opening_reminders',
+        'Branch opening reminders',
+        description: 'Reminders for employees assigned to open branches',
+        importance: Importance.high,
+      ),
+    );
+  }
+
+  static Future<void> _configureLocalTimezone() async {
+    tzdata.initializeTimeZones();
+    try {
+      final timezone = await FlutterTimezone.getLocalTimezone();
+      tz.setLocalLocation(tz.getLocation(timezone.identifier));
+    } catch (_) {
+      tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
+    }
+  }
+
+  static Future<void> _scheduleDailyReminders() async {
+    await _notifications.cancel(id: _legacyCheckInReminderId);
+    await _notifications.cancel(id: _legacyCheckOutReminderId);
+    await _notifications.cancel(id: _legacyRunningNotificationId);
+    await _notifications.cancel(id: _legacyBreakReminderId);
+    await _notifications.cancel(id: _checkInReminderId);
+    await _notifications.cancel(id: _logoutReminderId);
+    await _notifications.cancel(id: _checkInCompletedId);
+    await _notifications.cancel(id: _checkOutCompletedId);
+    await _stopActiveReminder();
+
+    final attendanceState = await _readStoredAttendanceState();
+    await _scheduleDailyReminder(
+      _TimedReminder.checkIn,
+      nextDay: attendanceState.hasCheckedInToday,
+    );
+    if (attendanceState.hasCheckedInToday &&
+        !attendanceState.hasCheckedOutToday) {
+      await _scheduleDailyReminder(_TimedReminder.logout);
+    } else {
+      await _notifications.cancel(id: _logoutReminderId);
+    }
+  }
+
+  static Future<void> _scheduleDailyReminder(
+    _TimedReminder reminder, {
+    bool nextDay = false,
+  }) async {
+    final androidScheduleMode = await _resolveAndroidScheduleMode();
+    await _notifications.zonedSchedule(
+      id: reminder.id,
+      title: 'Attica Attendance',
+      body: reminder.message,
+      scheduledDate: _nextInstanceOfTime(
+        hour: reminder.hour,
+        minute: 0,
+        nextDay: nextDay,
+      ),
+      notificationDetails: _reminderNotificationDetails,
+      androidScheduleMode: androidScheduleMode,
+      matchDateTimeComponents: nextDay ? null : DateTimeComponents.time,
+    );
+  }
+
+  static Future<void> _showReminderNotification(_TimedReminder reminder) async {
+    await _notifications.show(
+      id: reminder.id,
+      title: 'Attica Attendance',
+      body: reminder.message,
+      notificationDetails: _reminderNotificationDetails,
+    );
+  }
+
+  static Future<void> syncWithAttendance(AttendanceRecord? attendance) async {
+    final todayDate = _todayDate();
+    final hasCheckedInToday = _hasCheckedInToday(attendance, todayDate);
+    final hasValidActiveAttendance = _hasValidActiveAttendance(
+      attendance,
+      todayDate,
+    );
+    final hasCheckedOutToday = _hasCheckedOutToday(attendance, todayDate);
+    await _writeStoredAttendanceState(
+      checkedInToday: hasCheckedInToday || hasValidActiveAttendance,
+      checkedOutToday: hasCheckedOutToday,
+    );
+
+    if (hasCheckedInToday || hasValidActiveAttendance) {
+      await _notifications.cancel(id: _checkInReminderId);
+      await _scheduleDailyReminder(_TimedReminder.checkIn, nextDay: true);
+    } else if (_shouldShowCheckInReminder()) {
+      await _showReminderNotification(_TimedReminder.checkIn);
+    }
+
+    if (hasCheckedOutToday) {
+      await _notifications.cancel(id: _logoutReminderId);
+    } else if (hasValidActiveAttendance &&
+        _shouldShowCheckoutReminder()) {
+      await _notifications.cancel(id: _logoutReminderId);
+      await _showReminderNotification(_TimedReminder.logout);
+    } else if (hasValidActiveAttendance) {
+      await _scheduleDailyReminder(_TimedReminder.logout);
+    } else {
+      await _notifications.cancel(id: _logoutReminderId);
+    }
+  }
+
+  static Future<void> showAdminNotification(
+    EmployeePushNotification notification,
+  ) async {
+    final wasMarkedAsShown = await _markAdminNotificationAsShown(
+      notification.deliveryId,
+    );
+    if (!wasMarkedAsShown) {
+      return;
+    }
+
+    await _notifications.show(
+      id: _adminNotificationBaseId + notification.deliveryId,
+      title: notification.title.trim().isEmpty
+          ? 'Attica Pagar'
+          : notification.title.trim(),
+      body: notification.body,
+      notificationDetails: _adminNotificationDetails,
+    );
+  }
+
+  static Future<void> markCheckInCompleted() async {
+    await _writeStoredAttendanceState(
+      checkedInToday: true,
+      checkedOutToday: false,
+    );
+    await _notifications.cancel(id: _checkInReminderId);
+    await _notifications.cancel(id: _logoutReminderId);
+    await _scheduleDailyReminder(_TimedReminder.checkIn, nextDay: true);
+    if (_shouldShowCheckoutReminder()) {
+      await _showReminderNotification(_TimedReminder.logout);
+    } else {
+      await _scheduleDailyReminder(_TimedReminder.logout);
+    }
+    await _showCompletedNotification(
+      id: _checkInCompletedId,
+      message: 'Check in completed.',
+    );
+  }
+
+  static Future<void> markCheckOutCompleted() async {
+    await _writeStoredAttendanceState(
+      checkedInToday: true,
+      checkedOutToday: true,
+    );
+    await _notifications.cancel(id: _logoutReminderId);
+    await _showCompletedNotification(
+      id: _checkOutCompletedId,
+      message: 'Check out completed.',
+    );
+  }
+
+  static Future<void> clearForLogout() async {
+    await _notifications.cancel(id: _checkInReminderId);
+    await _notifications.cancel(id: _logoutReminderId);
+    await _notifications.cancel(id: _checkInCompletedId);
+    await _notifications.cancel(id: _checkOutCompletedId);
+    await _cancelBranchOpeningReminders();
+    await _stopActiveReminder();
+    await _writeStoredAttendanceState(
+      checkedInToday: false,
+      checkedOutToday: false,
+    );
+  }
+
+  static Future<void> syncBranchOpeningReminders(Employee? employee) async {
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) {
+      return;
+    }
+
+    await _cancelBranchOpeningReminders();
+
+    if (employee == null || !employee.isBranchOpeningEmployee) {
+      return;
+    }
+
+    final openingTime = _parseBranchOpeningTime(employee.branchOpeningTime);
+    if (openingTime == null) {
+      return;
+    }
+
+    final startMinutes = employee.branchOpeningReminderStartMinutes > 0
+        ? employee.branchOpeningReminderStartMinutes
+        : 120;
+    final intervalMinutes = employee.branchOpeningReminderIntervalMinutes > 0
+        ? employee.branchOpeningReminderIntervalMinutes
+        : 15;
+    final offsets = <int>[];
+    for (var offset = startMinutes; offset > 0; offset -= intervalMinutes) {
+      offsets.add(offset);
+    }
+    offsets.add(0);
+
+    final branchName = employee.branchName.trim();
+    final branchId = employee.branchId.trim();
+    final branchLabel = branchName.isNotEmpty
+        ? branchName
+        : (branchId.isNotEmpty ? branchId : 'your branch');
+    final openingLabel = _formatBranchOpeningTime(openingTime);
+    final androidScheduleMode = await _resolveAndroidScheduleMode();
+
+    for (var index = 0;
+        index < offsets.length && index < _branchOpeningReminderMaxSlots;
+        index += 1) {
+      final offset = offsets[index];
+      final reminderTime = _branchOpeningTimeMinusMinutes(
+        openingTime,
+        offset,
+      );
+      final isOpeningTime = offset == 0;
+      await _notifications.zonedSchedule(
+        id: _branchOpeningReminderBaseId + index,
+        title: 'Branch opening reminder',
+        body: isOpeningTime
+            ? 'It is time to open $branchLabel. Please open the branch now.'
+            : '$branchLabel opens at $openingLabel. Please be ready to open the branch.',
+        scheduledDate: _nextInstanceOfTime(
+          hour: reminderTime.hour,
+          minute: reminderTime.minute,
+        ),
+        notificationDetails: _branchOpeningNotificationDetails,
+        androidScheduleMode: androidScheduleMode,
+        matchDateTimeComponents: DateTimeComponents.time,
+      );
+    }
+  }
+
+  static Future<void> _cancelBranchOpeningReminders() async {
+    for (var index = 0; index < _branchOpeningReminderMaxSlots; index += 1) {
+      await _notifications.cancel(id: _branchOpeningReminderBaseId + index);
+    }
+  }
+
+  static Future<void> _stopActiveReminder() async {
+    await _notifications.cancel(id: _checkInReminderId);
+    await _notifications.cancel(id: _logoutReminderId);
+  }
+
+  static Future<bool> _markAdminNotificationAsShown(int deliveryId) async {
+    final preferences = await SharedPreferences.getInstance();
+    final shownIds =
+        preferences
+            .getStringList(_shownAdminNotificationIdsKey)
+            ?.map(int.tryParse)
+            .whereType<int>()
+            .toList()
+          ?..sort();
+
+    final normalizedShownIds = shownIds ?? <int>[];
+    if (normalizedShownIds.contains(deliveryId)) {
+      return false;
+    }
+
+    normalizedShownIds.add(deliveryId);
+    const maxStoredIds = 500;
+    if (normalizedShownIds.length > maxStoredIds) {
+      normalizedShownIds.removeRange(
+        0,
+        normalizedShownIds.length - maxStoredIds,
+      );
+    }
+
+    await preferences.setStringList(
+      _shownAdminNotificationIdsKey,
+      normalizedShownIds.map((id) => id.toString()).toList(),
+    );
+    return true;
+  }
+
+  static Future<void> _ensureExactAlarmPermission(
+    AndroidFlutterLocalNotificationsPlugin? androidPlugin,
+  ) async {
+    if (androidPlugin == null) {
+      return;
+    }
+
+    final canScheduleExact = await androidPlugin
+        .canScheduleExactNotifications();
+    if (canScheduleExact == false) {
+      await androidPlugin.requestExactAlarmsPermission();
+    }
+  }
+
+  static Future<AndroidScheduleMode> _resolveAndroidScheduleMode() async {
+    if (!Platform.isAndroid) {
+      return AndroidScheduleMode.inexactAllowWhileIdle;
+    }
+
+    final androidPlugin = _notifications
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    final canScheduleExact = await androidPlugin
+        ?.canScheduleExactNotifications();
+    if (canScheduleExact == true) {
+      return AndroidScheduleMode.exactAllowWhileIdle;
+    }
+    return AndroidScheduleMode.inexactAllowWhileIdle;
+  }
+
+  static Future<void> _showCompletedNotification({
+    required int id,
+    required String message,
+  }) async {
+    await _notifications.show(
+      id: id,
+      title: 'Attica Attendance',
+      body: message,
+      notificationDetails: _completedNotificationDetails,
+    );
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 5)).then((_) {
+        return _notifications.cancel(id: id);
+      }),
+    );
+  }
+
+  static bool _shouldShowCheckInReminder() {
+    final hour = tz.TZDateTime.now(tz.local).hour;
+    return hour >= 8;
+  }
+
+  static bool _shouldShowCheckoutReminder() {
+    final hour = tz.TZDateTime.now(tz.local).hour;
+    return hour >= 18;
+  }
+
+  static bool _hasCheckedInToday(
+    AttendanceRecord? attendance,
+    String todayDate,
+  ) {
+    return attendance != null && attendance.checkInDate == todayDate;
+  }
+
+  static bool _hasValidActiveAttendance(
+    AttendanceRecord? attendance,
+    String todayDate,
+  ) {
+    if (attendance == null || attendance.hasCheckedOut) {
+      return false;
+    }
+
+    return attendance.checkInDate == todayDate || attendance.isNightShift;
+  }
+
+  static bool _hasCheckedOutToday(
+    AttendanceRecord? attendance,
+    String todayDate,
+  ) {
+    if (attendance == null || !attendance.hasCheckedOut) {
+      return false;
+    }
+
+    final checkOutDate = (attendance.checkOutDate ?? attendance.checkInDate)
+        .trim();
+    return checkOutDate == todayDate;
+  }
+
+  static String _todayDate() {
+    final now = tz.TZDateTime.now(tz.local);
+    final month = now.month.toString().padLeft(2, '0');
+    final day = now.day.toString().padLeft(2, '0');
+    return '${now.year}-$month-$day';
+  }
+
+  static Future<_StoredAttendanceState> _readStoredAttendanceState() async {
+    final todayDate = _todayDate();
+    final preferences = await SharedPreferences.getInstance();
+    return _StoredAttendanceState(
+      hasCheckedInToday:
+          preferences.getString(_checkInCompletedDateKey) == todayDate,
+      hasCheckedOutToday:
+          preferences.getString(_checkOutCompletedDateKey) == todayDate,
+    );
+  }
+
+  static Future<void> _writeStoredAttendanceState({
+    required bool checkedInToday,
+    required bool checkedOutToday,
+  }) async {
+    final todayDate = _todayDate();
+    final preferences = await SharedPreferences.getInstance();
+    if (checkedInToday) {
+      await preferences.setString(_checkInCompletedDateKey, todayDate);
+    } else {
+      await preferences.remove(_checkInCompletedDateKey);
+    }
+
+    if (checkedOutToday) {
+      await preferences.setString(_checkOutCompletedDateKey, todayDate);
+    } else {
+      await preferences.remove(_checkOutCompletedDateKey);
+    }
+  }
+
+  static tz.TZDateTime _nextInstanceOfTime({
+    required int hour,
+    required int minute,
+    bool nextDay = false,
+  }) {
+    final now = tz.TZDateTime.now(tz.local);
+    var scheduledDate = tz.TZDateTime(
+      tz.local,
+      now.year,
+      now.month,
+      now.day,
+      hour,
+      minute,
+    );
+    if (nextDay ||
+        scheduledDate.isBefore(now) ||
+        scheduledDate.isAtSameMomentAs(now)) {
+      scheduledDate = scheduledDate.add(const Duration(days: 1));
+    }
+    return scheduledDate;
+  }
+
+  static _BranchOpeningTime? _parseBranchOpeningTime(String value) {
+    final match = RegExp(r'^(\d{1,2}):(\d{2})').firstMatch(value.trim());
+    if (match == null) {
+      return null;
+    }
+
+    final hour = int.tryParse(match.group(1) ?? '');
+    final minute = int.tryParse(match.group(2) ?? '');
+    if (hour == null ||
+        minute == null ||
+        hour < 0 ||
+        hour > 23 ||
+        minute < 0 ||
+        minute > 59) {
+      return null;
+    }
+
+    return _BranchOpeningTime(hour: hour, minute: minute);
+  }
+
+  static _BranchOpeningTime _branchOpeningTimeMinusMinutes(
+    _BranchOpeningTime time,
+    int minutes,
+  ) {
+    const dayMinutes = 24 * 60;
+    var totalMinutes = (time.hour * 60 + time.minute - minutes) % dayMinutes;
+    if (totalMinutes < 0) {
+      totalMinutes += dayMinutes;
+    }
+
+    return _BranchOpeningTime(
+      hour: totalMinutes ~/ 60,
+      minute: totalMinutes % 60,
+    );
+  }
+
+  static String _formatBranchOpeningTime(_BranchOpeningTime time) {
+    final hour = time.hour.toString().padLeft(2, '0');
+    final minute = time.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+}
+
+class PushMessagingService {
+  PushMessagingService._();
+
+  static bool _initialized = false;
+  static bool _available = false;
+
+  static bool get isAvailable => _available;
+
+  static Future<void> initialize() async {
+    if (_initialized) {
+      return;
+    }
+
+    _initialized = true;
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) {
+      return;
+    }
+
+    try {
+      await Firebase.initializeApp();
+      FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+      await FirebaseMessaging.instance.setAutoInitEnabled(true);
+      _available = true;
+    } catch (_) {
+      _available = false;
+    }
+  }
+
+  static Future<void> requestPermission() async {
+    if (!_available) {
+      return;
+    }
+
+    try {
+      await FirebaseMessaging.instance.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+    } catch (_) {
+      // Keep the app usable even if Firebase permissions are unavailable.
+    }
+  }
+
+  static Future<void> configureForegroundPresentation() async {
+    if (!_available) {
+      return;
+    }
+
+    try {
+      await FirebaseMessaging.instance
+          .setForegroundNotificationPresentationOptions(
+            alert: true,
+            badge: true,
+            sound: true,
+          );
+    } catch (_) {
+      // Android ignores this; Apple platforms may throw before full setup.
+    }
+  }
+
+  static Future<String?> currentToken() async {
+    if (!_available) {
+      return null;
+    }
+
+    try {
+      return await FirebaseMessaging.instance.getToken();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<RemoteMessage?> initialMessage() async {
+    if (!_available) {
+      return null;
+    }
+
+    try {
+      return await FirebaseMessaging.instance.getInitialMessage();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Stream<RemoteMessage> get onMessage =>
+      _available ? FirebaseMessaging.onMessage : Stream<RemoteMessage>.empty();
+
+  static Stream<RemoteMessage> get onMessageOpenedApp =>
+      _available
+          ? FirebaseMessaging.onMessageOpenedApp
+          : Stream<RemoteMessage>.empty();
+
+  static Stream<String> get onTokenRefresh =>
+      _available
+          ? FirebaseMessaging.instance.onTokenRefresh
+          : Stream<String>.empty();
+
+  static String get platform {
+    if (Platform.isAndroid) {
+      return 'android';
+    }
+    if (Platform.isIOS) {
+      return 'ios';
+    }
+    if (Platform.isMacOS) {
+      return 'macos';
+    }
+
+    return 'web';
+  }
+}
+
+class _BranchOpeningTime {
+  const _BranchOpeningTime({required this.hour, required this.minute});
+
+  final int hour;
+  final int minute;
+}
+
+class _StoredAttendanceState {
+  const _StoredAttendanceState({
+    required this.hasCheckedInToday,
+    required this.hasCheckedOutToday,
+  });
+
+  final bool hasCheckedInToday;
+  final bool hasCheckedOutToday;
+}
+
+enum _TimedReminder {
+  checkIn(1009, 8, 'Don\'t forget to check in.'),
+  logout(1018, 18, 'Don\'t forget to logout.');
+
+  const _TimedReminder(this.id, this.hour, this.message);
+
+  final int id;
+  final int hour;
+  final String message;
 }
 
 class EmployeePortalApp extends StatelessWidget {
@@ -50,6 +870,21 @@ class EmployeePortalApp extends StatelessWidget {
             fontWeight: FontWeight.w800,
             color: AppColors.text,
           ),
+        ),
+        progressIndicatorTheme: const ProgressIndicatorThemeData(
+          color: AppColors.accent,
+          circularTrackColor: AppColors.primarySoft,
+          linearTrackColor: AppColors.primarySoft,
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            backgroundColor: AppColors.primary,
+            foregroundColor: Colors.white,
+          ),
+        ),
+        floatingActionButtonTheme: const FloatingActionButtonThemeData(
+          backgroundColor: AppColors.accent,
+          foregroundColor: AppColors.text,
         ),
         textTheme: GoogleFonts.interTextTheme(baseTheme.textTheme).copyWith(
           bodyLarge: baseTextTheme.bodyLarge?.copyWith(color: AppColors.text),
@@ -184,16 +1019,16 @@ class _LaunchSplashScreenState extends State<_LaunchSplashScreen>
 }
 
 class AppColors {
-  static const background = Color(0xFFF7F2F8);
+  static const background = Color(0xFFFFF7EA);
   static const surface = Color(0xFFFFFFFF);
-  static const surfaceTint = Color(0xFFF0E7F7);
-  static const primary = Color(0xFF5A16C9);
-  static const primaryDark = Color(0xFF3E0A96);
-  static const primarySoft = Color(0xFFE8DBFF);
-  static const accent = Color(0xFFE2B94E);
-  static const secondary = Color(0xFF52627B);
-  static const text = Color(0xFF1C1B1F);
-  static const subtleText = Color(0xFF6A6672);
+  static const surfaceTint = Color(0xFFFFE7C2);
+  static const primary = Color(0xFFC62828);
+  static const primaryDark = Color(0xFF8E1111);
+  static const primarySoft = Color(0xFFFFD6C8);
+  static const accent = Color(0xFFD4A017);
+  static const secondary = Color(0xFF8A5B12);
+  static const text = Color(0xFF2A1712);
+  static const subtleText = Color(0xFF7A5A4B);
   static const success = Color(0xFF1F8F55);
 }
 
@@ -276,12 +1111,30 @@ class ApiConfig {
       normalized = '$normalized/api';
     }
 
-    return normalized;
+    final parsed = Uri.tryParse(normalized);
+    if (parsed == null) {
+      return normalized;
+    }
+
+    return _normalizeLoopbackUri(parsed).toString();
   }
 
   static bool isValid(String value) {
     final parsed = Uri.tryParse(normalize(value));
     return parsed != null && parsed.hasScheme && parsed.host.isNotEmpty;
+  }
+
+  static Uri _normalizeLoopbackUri(Uri uri) {
+    if (!Platform.isAndroid) {
+      return uri;
+    }
+
+    final host = uri.host.trim().toLowerCase();
+    if (host != '127.0.0.1' && host != 'localhost') {
+      return uri;
+    }
+
+    return uri.replace(host: '10.0.2.2');
   }
 }
 
@@ -298,6 +1151,7 @@ class Employee {
     required this.contact,
     required this.mailId,
     required this.address,
+    required this.dateOfBirth,
     required this.gender,
     required this.maritalStatus,
     required this.location,
@@ -306,9 +1160,14 @@ class Employee {
     required this.photoUrl,
     required this.rating,
     required this.status,
+    required this.isNightShift,
     required this.salary,
     required this.advance,
     required this.pf,
+    required this.isBranchOpeningEmployee,
+    required this.branchOpeningTime,
+    required this.branchOpeningReminderStartMinutes,
+    required this.branchOpeningReminderIntervalMinutes,
   });
 
   final int id;
@@ -322,6 +1181,7 @@ class Employee {
   final String contact;
   final String mailId;
   final String address;
+  final String dateOfBirth;
   final String gender;
   final String maritalStatus;
   final String location;
@@ -330,9 +1190,14 @@ class Employee {
   final String photoUrl;
   final int rating;
   final String status;
+  final bool isNightShift;
   final int? salary;
   final int? advance;
   final int? pf;
+  final bool isBranchOpeningEmployee;
+  final String branchOpeningTime;
+  final int branchOpeningReminderStartMinutes;
+  final int branchOpeningReminderIntervalMinutes;
 
   bool get hasPhoto => photo.trim().isNotEmpty || photoUrl.trim().isNotEmpty;
 
@@ -382,6 +1247,11 @@ class Employee {
       contact: json['contact']?.toString() ?? '',
       mailId: json['mailId']?.toString() ?? '',
       address: json['address']?.toString() ?? '',
+      dateOfBirth:
+          json['dateOfBirth']?.toString() ??
+          json['date_of_birth']?.toString() ??
+          json['dob']?.toString() ??
+          '',
       gender: json['gender']?.toString() ?? '',
       maritalStatus:
           json['maritalStatus']?.toString() ??
@@ -393,9 +1263,16 @@ class Employee {
       photoUrl: json['photoUrl']?.toString() ?? '',
       rating: parseNullableInt(json['rating']) ?? 0,
       status: json['status']?.toString() ?? 'Inactive',
+      isNightShift: _parseBool(json['isNightShift']),
       salary: parseNullableInt(json['salary']),
       advance: parseNullableInt(json['advance']),
       pf: parseNullableInt(json['pf']),
+      isBranchOpeningEmployee: _parseBool(json['isBranchOpeningEmployee']),
+      branchOpeningTime: json['branchOpeningTime']?.toString() ?? '',
+      branchOpeningReminderStartMinutes:
+          parseNullableInt(json['branchOpeningReminderStartMinutes']) ?? 120,
+      branchOpeningReminderIntervalMinutes:
+          parseNullableInt(json['branchOpeningReminderIntervalMinutes']) ?? 15,
     );
   }
 
@@ -411,6 +1288,7 @@ class Employee {
     String? contact,
     String? mailId,
     String? address,
+    String? dateOfBirth,
     String? gender,
     String? maritalStatus,
     String? location,
@@ -419,9 +1297,14 @@ class Employee {
     String? photoUrl,
     int? rating,
     String? status,
+    bool? isNightShift,
     int? salary,
     int? advance,
     int? pf,
+    bool? isBranchOpeningEmployee,
+    String? branchOpeningTime,
+    int? branchOpeningReminderStartMinutes,
+    int? branchOpeningReminderIntervalMinutes,
   }) {
     return Employee(
       id: id ?? this.id,
@@ -435,6 +1318,7 @@ class Employee {
       contact: contact ?? this.contact,
       mailId: mailId ?? this.mailId,
       address: address ?? this.address,
+      dateOfBirth: dateOfBirth ?? this.dateOfBirth,
       gender: gender ?? this.gender,
       maritalStatus: maritalStatus ?? this.maritalStatus,
       location: location ?? this.location,
@@ -443,9 +1327,19 @@ class Employee {
       photoUrl: photoUrl ?? this.photoUrl,
       rating: rating ?? this.rating,
       status: status ?? this.status,
+      isNightShift: isNightShift ?? this.isNightShift,
       salary: salary ?? this.salary,
       advance: advance ?? this.advance,
       pf: pf ?? this.pf,
+      isBranchOpeningEmployee:
+          isBranchOpeningEmployee ?? this.isBranchOpeningEmployee,
+      branchOpeningTime: branchOpeningTime ?? this.branchOpeningTime,
+      branchOpeningReminderStartMinutes:
+          branchOpeningReminderStartMinutes ??
+          this.branchOpeningReminderStartMinutes,
+      branchOpeningReminderIntervalMinutes:
+          branchOpeningReminderIntervalMinutes ??
+          this.branchOpeningReminderIntervalMinutes,
     );
   }
 }
@@ -467,6 +1361,7 @@ class AttendanceRecord {
     required this.checkInTime,
     required this.checkOutDate,
     required this.checkOutTime,
+    required this.isNightShift,
   });
 
   final int id;
@@ -484,6 +1379,7 @@ class AttendanceRecord {
   final String checkInTime;
   final String? checkOutDate;
   final String? checkOutTime;
+  final bool isNightShift;
 
   bool get hasCheckedOut =>
       (checkOutDate ?? '').isNotEmpty && (checkOutTime ?? '').isNotEmpty;
@@ -514,8 +1410,11 @@ class AttendanceRecord {
       return null;
     }
 
-    final checkIn = _parseAttendanceTime(checkInTime);
-    final checkOut = _parseAttendanceTime(checkOutTime);
+    final checkIn = _parseAttendanceDateTime(checkInDate, checkInTime);
+    final checkOut = _parseAttendanceDateTime(
+      checkOutDate ?? checkInDate,
+      checkOutTime,
+    );
 
     if (checkIn == null || checkOut == null) {
       return null;
@@ -591,6 +1490,76 @@ class AttendanceRecord {
       checkInTime: json['checkInTime']?.toString() ?? '',
       checkOutDate: json['checkOutDate']?.toString(),
       checkOutTime: json['checkOutTime']?.toString(),
+      isNightShift: _parseBool(json['isNightShift']),
+    );
+  }
+}
+
+class EmployeePushNotification {
+  const EmployeePushNotification({
+    required this.deliveryId,
+    required this.notificationId,
+    required this.title,
+    required this.body,
+    required this.sentAt,
+    required this.readAt,
+  });
+
+  final int deliveryId;
+  final int notificationId;
+  final String title;
+  final String body;
+  final String sentAt;
+  final String readAt;
+
+  bool get isRead => readAt.trim().isNotEmpty;
+
+  factory EmployeePushNotification.fromJson(Map<String, dynamic> json) {
+    return EmployeePushNotification(
+      deliveryId: int.tryParse(json['deliveryId']?.toString() ?? '') ?? 0,
+      notificationId:
+          int.tryParse(json['notificationId']?.toString() ?? '') ?? 0,
+      title: json['title']?.toString() ?? 'Attica Pagar',
+      body: json['body']?.toString() ?? '',
+      sentAt: json['sentAt']?.toString() ?? '',
+      readAt: json['readAt']?.toString() ?? '',
+    );
+  }
+
+  factory EmployeePushNotification.fromRemoteMessage(RemoteMessage message) {
+    final data = message.data;
+    final resolvedTitle = (data['title']?.toString() ?? '').trim();
+    final resolvedBody = (data['body']?.toString() ?? '').trim();
+    final fallbackTitle = (message.notification?.title ?? '').trim();
+
+    return EmployeePushNotification(
+      deliveryId: int.tryParse(data['deliveryId']?.toString() ?? '') ?? 0,
+      notificationId:
+          int.tryParse(data['notificationId']?.toString() ?? '') ?? 0,
+      title:
+          resolvedTitle.isNotEmpty
+              ? resolvedTitle
+              : (fallbackTitle.isNotEmpty ? fallbackTitle : 'Attica Pagar'),
+      body:
+          resolvedBody.isNotEmpty
+              ? resolvedBody
+              : (message.notification?.body ?? ''),
+      sentAt:
+          data['sentAt']?.toString() ??
+          message.sentTime?.toIso8601String() ??
+          '',
+      readAt: '',
+    );
+  }
+
+  EmployeePushNotification copyWith({String? readAt}) {
+    return EmployeePushNotification(
+      deliveryId: deliveryId,
+      notificationId: notificationId,
+      title: title,
+      body: body,
+      sentAt: sentAt,
+      readAt: readAt ?? this.readAt,
     );
   }
 }
@@ -741,6 +1710,211 @@ class SiteVisitRequestRecord {
   }
 }
 
+class TeTrackerBranch {
+  const TeTrackerBranch({
+    required this.branchId,
+    required this.branchName,
+    required this.address,
+    required this.city,
+    required this.state,
+    required this.timings,
+    required this.latitude,
+    required this.longitude,
+    required this.mapUrl,
+  });
+
+  final String branchId;
+  final String branchName;
+  final String address;
+  final String city;
+  final String state;
+  final String timings;
+  final double? latitude;
+  final double? longitude;
+  final String mapUrl;
+
+  String get label =>
+      branchName.trim().isNotEmpty ? '$branchId - $branchName' : branchId;
+
+  factory TeTrackerBranch.fromJson(Map<String, dynamic> json) {
+    double? parseNullableDouble(dynamic value) {
+      if (value == null) {
+        return null;
+      }
+
+      return double.tryParse(value.toString());
+    }
+
+    return TeTrackerBranch(
+      branchId: json['branchId']?.toString() ?? '',
+      branchName: json['branchName']?.toString() ?? '',
+      address: json['address']?.toString() ?? '',
+      city: json['city']?.toString() ?? '',
+      state: json['state']?.toString() ?? '',
+      timings: json['timings']?.toString() ?? '',
+      latitude: parseNullableDouble(json['latitude']),
+      longitude: parseNullableDouble(json['longitude']),
+      mapUrl: json['mapUrl']?.toString() ?? '',
+    );
+  }
+}
+
+class TeTrackerVisitRecord {
+  const TeTrackerVisitRecord({
+    required this.id,
+    required this.sequence,
+    required this.branchId,
+    required this.branchName,
+    required this.visitDate,
+    required this.visitTime,
+    required this.photoUrl,
+    required this.capturedLatitude,
+    required this.capturedLongitude,
+    required this.branchLatitude,
+    required this.branchLongitude,
+    required this.distanceFromBranchMeters,
+    required this.distanceFromBranchLabel,
+    required this.distanceFromPreviousMeters,
+    required this.distanceFromPreviousLabel,
+    required this.cumulativeDistanceMeters,
+    required this.cumulativeDistanceLabel,
+  });
+
+  final int id;
+  final int sequence;
+  final String branchId;
+  final String branchName;
+  final String visitDate;
+  final String visitTime;
+  final String photoUrl;
+  final double? capturedLatitude;
+  final double? capturedLongitude;
+  final double? branchLatitude;
+  final double? branchLongitude;
+  final double? distanceFromBranchMeters;
+  final String distanceFromBranchLabel;
+  final double? distanceFromPreviousMeters;
+  final String distanceFromPreviousLabel;
+  final double cumulativeDistanceMeters;
+  final String cumulativeDistanceLabel;
+
+  String get branchLabel =>
+      branchName.trim().isNotEmpty ? '$branchId - $branchName' : branchId;
+
+  factory TeTrackerVisitRecord.fromJson(Map<String, dynamic> json) {
+    int parseInt(dynamic value) => int.tryParse(value?.toString() ?? '') ?? 0;
+
+    double? parseNullableDouble(dynamic value) {
+      if (value == null) {
+        return null;
+      }
+
+      return double.tryParse(value.toString());
+    }
+
+    return TeTrackerVisitRecord(
+      id: parseInt(json['id']),
+      sequence: parseInt(json['sequence']),
+      branchId: json['branchId']?.toString() ?? '',
+      branchName: json['branchName']?.toString() ?? '',
+      visitDate: json['visitDate']?.toString() ?? '',
+      visitTime: json['visitTime']?.toString() ?? '',
+      photoUrl: json['photoUrl']?.toString() ?? '',
+      capturedLatitude: parseNullableDouble(json['capturedLatitude']),
+      capturedLongitude: parseNullableDouble(json['capturedLongitude']),
+      branchLatitude: parseNullableDouble(json['branchLatitude']),
+      branchLongitude: parseNullableDouble(json['branchLongitude']),
+      distanceFromBranchMeters: parseNullableDouble(
+        json['distanceFromBranchMeters'],
+      ),
+      distanceFromBranchLabel:
+          json['distanceFromBranchLabel']?.toString() ?? '--',
+      distanceFromPreviousMeters: parseNullableDouble(
+        json['distanceFromPreviousMeters'],
+      ),
+      distanceFromPreviousLabel:
+          json['distanceFromPreviousLabel']?.toString() ?? 'Start',
+      cumulativeDistanceMeters:
+          parseNullableDouble(json['cumulativeDistanceMeters']) ?? 0,
+      cumulativeDistanceLabel:
+          json['cumulativeDistanceLabel']?.toString() ?? '0 m',
+    );
+  }
+}
+
+class TeTrackerHistorySummary {
+  const TeTrackerHistorySummary({
+    required this.totalVisits,
+    required this.uniqueBranches,
+    required this.totalDistanceMeters,
+    required this.totalDistanceLabel,
+    required this.startBranchLabel,
+    required this.endBranchLabel,
+  });
+
+  final int totalVisits;
+  final int uniqueBranches;
+  final double totalDistanceMeters;
+  final String totalDistanceLabel;
+  final String startBranchLabel;
+  final String endBranchLabel;
+
+  factory TeTrackerHistorySummary.fromJson(Map<String, dynamic> json) {
+    int parseInt(dynamic value) => int.tryParse(value?.toString() ?? '') ?? 0;
+    double parseDouble(dynamic value) =>
+        double.tryParse(value?.toString() ?? '') ?? 0;
+
+    return TeTrackerHistorySummary(
+      totalVisits: parseInt(json['totalVisits']),
+      uniqueBranches: parseInt(json['uniqueBranches']),
+      totalDistanceMeters: parseDouble(json['totalDistanceMeters']),
+      totalDistanceLabel: json['totalDistanceLabel']?.toString() ?? '0 m',
+      startBranchLabel: json['startBranchLabel']?.toString() ?? 'No visits',
+      endBranchLabel: json['endBranchLabel']?.toString() ?? 'No visits',
+    );
+  }
+}
+
+class TeTrackerHistoryResponse {
+  const TeTrackerHistoryResponse({
+    required this.date,
+    required this.visits,
+    required this.summary,
+  });
+
+  final String date;
+  final List<TeTrackerVisitRecord> visits;
+  final TeTrackerHistorySummary summary;
+
+  factory TeTrackerHistoryResponse.fromJson(Map<String, dynamic> json) {
+    return TeTrackerHistoryResponse(
+      date: json['date']?.toString() ?? '',
+      visits: json['visits'] is List
+          ? (json['visits'] as List)
+                .whereType<Map>()
+                .map(
+                  (item) => TeTrackerVisitRecord.fromJson(
+                    Map<String, dynamic>.from(item),
+                  ),
+                )
+                .toList()
+          : const <TeTrackerVisitRecord>[],
+      summary: json['summary'] is Map
+          ? TeTrackerHistorySummary.fromJson(
+              Map<String, dynamic>.from(json['summary'] as Map),
+            )
+          : const TeTrackerHistorySummary(
+              totalVisits: 0,
+              uniqueBranches: 0,
+              totalDistanceMeters: 0,
+              totalDistanceLabel: '0 m',
+              startBranchLabel: 'No visits',
+              endBranchLabel: 'No visits',
+            ),
+    );
+  }
+}
+
 class SalarySummary {
   const SalarySummary({
     required this.month,
@@ -814,9 +1988,7 @@ class ApiException implements Exception {
 }
 
 class FakeLocationIssue {
-  const FakeLocationIssue({
-    required this.message,
-  });
+  const FakeLocationIssue({required this.message});
 
   final String message;
 
@@ -833,7 +2005,7 @@ class LocationIntegrityService {
   const LocationIntegrityService._();
 
   static const MethodChannel _channel = MethodChannel(
-    'com.example.frontend/location_integrity',
+    'app.abhibs.locatoremployee/location_integrity',
   );
 
   static Future<void> ensureTrustedPosition(
@@ -856,6 +2028,89 @@ class LocationIntegrityService {
     }
 
     await _channel.invokeMethod<void>('openDeveloperSettings');
+  }
+}
+
+class AdminNotificationBackgroundService {
+  AdminNotificationBackgroundService._();
+
+  static const Duration _periodicFrequency = Duration(minutes: 15);
+  static const Duration _oneOffDelay = Duration(seconds: 20);
+  static final Constraints _networkConstraints = Constraints(
+    networkType: NetworkType.connected,
+  );
+
+  static Future<void> ensureScheduled() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    await Workmanager().registerPeriodicTask(
+      _adminNotificationBackgroundPeriodicTaskUniqueName,
+      _adminNotificationBackgroundTaskName,
+      frequency: _periodicFrequency,
+      constraints: _networkConstraints,
+      existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
+    );
+    await scheduleImmediateSync();
+  }
+
+  static Future<void> scheduleImmediateSync() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    await Workmanager().registerOneOffTask(
+      _adminNotificationBackgroundOneOffTaskUniqueName,
+      _adminNotificationBackgroundTaskName,
+      initialDelay: _oneOffDelay,
+      constraints: _networkConstraints,
+      existingWorkPolicy: ExistingWorkPolicy.replace,
+    );
+  }
+
+  static Future<void> cancelAll() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    await Workmanager().cancelByUniqueName(
+      _adminNotificationBackgroundPeriodicTaskUniqueName,
+    );
+    await Workmanager().cancelByUniqueName(
+      _adminNotificationBackgroundOneOffTaskUniqueName,
+    );
+  }
+
+  static Future<bool> runBackgroundSync() async {
+    try {
+      final token = await const EmployeeSessionStore().readToken();
+      if (token == null || token.isEmpty) {
+        return true;
+      }
+
+      const apiClient = EmployeeApiClient();
+      final notifications = await apiClient
+          .pendingNotifications(token: token)
+          .timeout(const Duration(seconds: 12));
+
+      for (final notification in notifications) {
+        await AttendanceNotificationService.showAdminNotification(notification);
+      }
+
+      if (notifications.isNotEmpty) {
+        final employee = await apiClient
+            .profile(token)
+            .timeout(const Duration(seconds: 12));
+        await AttendanceNotificationService.syncBranchOpeningReminders(
+          employee,
+        );
+      }
+
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 }
 
@@ -1047,6 +2302,7 @@ class EmployeeApiClient {
     required String contact,
     required String mailId,
     required String address,
+    required String dateOfBirth,
     required String gender,
     required String maritalStatus,
   }) async {
@@ -1062,6 +2318,7 @@ class EmployeeApiClient {
         'contact': contact,
         'mailId': mailId,
         'address': address,
+        'dateOfBirth': dateOfBirth,
         'gender': gender,
         'maritalStatus': maritalStatus,
       }),
@@ -1236,6 +2493,140 @@ class EmployeeApiClient {
     );
   }
 
+  Future<List<EmployeePushNotification>> pendingNotifications({
+    required String token,
+  }) async {
+    final response = await http.get(
+      Uri.parse('${ApiConfig.baseUrl}/notifications/pending'),
+      headers: {'Accept': 'application/json', 'Authorization': 'Bearer $token'},
+    );
+
+    final payload = _decodePayload(response);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      final notifications = payload['notifications'];
+      if (notifications is List) {
+        return notifications
+            .whereType<Map>()
+            .map(
+              (item) => EmployeePushNotification.fromJson(
+                Map<String, dynamic>.from(item),
+              ),
+            )
+            .where((notification) => notification.deliveryId > 0)
+            .toList();
+      }
+
+      return const <EmployeePushNotification>[];
+    }
+
+    throw _buildApiException(
+      payload,
+      fallback: 'Unable to load notifications right now.',
+    );
+  }
+
+  Future<List<EmployeePushNotification>> notifications({
+    required String token,
+  }) async {
+    final response = await http.get(
+      Uri.parse('${ApiConfig.baseUrl}/notifications'),
+      headers: {'Accept': 'application/json', 'Authorization': 'Bearer $token'},
+    );
+
+    final payload = _decodePayload(response);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      final notifications = payload['notifications'];
+      if (notifications is List) {
+        return notifications
+            .whereType<Map>()
+            .map(
+              (item) => EmployeePushNotification.fromJson(
+                Map<String, dynamic>.from(item),
+              ),
+            )
+            .where((notification) => notification.deliveryId > 0)
+            .toList();
+      }
+
+      return const <EmployeePushNotification>[];
+    }
+
+    throw _buildApiException(
+      payload,
+      fallback: 'Unable to load notifications right now.',
+    );
+  }
+
+  Future<void> registerDeviceToken({
+    required String token,
+    required String deviceToken,
+    required String platform,
+  }) async {
+    final response = await http.post(
+      Uri.parse('${ApiConfig.baseUrl}/notifications/device-token'),
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $token',
+      },
+      body: jsonEncode({'token': deviceToken, 'platform': platform}),
+    );
+
+    final payload = _decodePayload(response);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return;
+    }
+
+    throw _buildApiException(
+      payload,
+      fallback: 'Unable to register notifications on this device right now.',
+    );
+  }
+
+  Future<void> removeDeviceToken({
+    required String token,
+    required String deviceToken,
+  }) async {
+    final response = await http.post(
+      Uri.parse('${ApiConfig.baseUrl}/notifications/device-token/remove'),
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $token',
+      },
+      body: jsonEncode({'token': deviceToken}),
+    );
+
+    final payload = _decodePayload(response);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return;
+    }
+
+    throw _buildApiException(
+      payload,
+      fallback: 'Unable to unregister notifications on this device right now.',
+    );
+  }
+
+  Future<void> markNotificationsRead({
+    required String token,
+    required List<int> deliveryIds,
+  }) async {
+    if (deliveryIds.isEmpty) {
+      return;
+    }
+
+    await http.post(
+      Uri.parse('${ApiConfig.baseUrl}/notifications/read'),
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $token',
+      },
+      body: jsonEncode({'deliveryIds': deliveryIds}),
+    );
+  }
+
   Future<String> submitSiteVisit({
     required String token,
     required DateTime visitDate,
@@ -1273,6 +2664,98 @@ class EmployeeApiClient {
     throw _buildApiException(
       payload,
       fallback: 'Unable to submit site visit request right now.',
+    );
+  }
+
+  Future<List<TeTrackerBranch>> teTrackerBranches({
+    required String token,
+  }) async {
+    final response = await http.get(
+      Uri.parse('${ApiConfig.baseUrl}/te-tracker/branches'),
+      headers: {'Accept': 'application/json', 'Authorization': 'Bearer $token'},
+    );
+
+    final payload = _decodePayload(response);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      final branches = payload['branches'];
+      if (branches is List) {
+        return branches
+            .whereType<Map>()
+            .map(
+              (item) =>
+                  TeTrackerBranch.fromJson(Map<String, dynamic>.from(item)),
+            )
+            .toList();
+      }
+
+      return const <TeTrackerBranch>[];
+    }
+
+    throw _buildApiException(
+      payload,
+      fallback: 'Unable to load TE tracker branches right now.',
+    );
+  }
+
+  Future<TeTrackerHistoryResponse> teTrackerVisits({
+    required String token,
+    String? date,
+  }) async {
+    final queryParameters = <String, String>{};
+    if ((date ?? '').trim().isNotEmpty) {
+      queryParameters['date'] = date!.trim();
+    }
+
+    final response = await http.get(
+      Uri.parse('${ApiConfig.baseUrl}/te-tracker/visits').replace(
+        queryParameters: queryParameters.isEmpty ? null : queryParameters,
+      ),
+      headers: {'Accept': 'application/json', 'Authorization': 'Bearer $token'},
+    );
+
+    final payload = _decodePayload(response);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return TeTrackerHistoryResponse.fromJson(payload);
+    }
+
+    throw _buildApiException(
+      payload,
+      fallback: 'Unable to load TE tracker visits right now.',
+    );
+  }
+
+  Future<String> teTrackerCheckIn({
+    required String token,
+    required String branchId,
+    required double latitude,
+    required double longitude,
+    required File photo,
+  }) async {
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('${ApiConfig.baseUrl}/te-tracker/check-in'),
+    );
+
+    request.headers.addAll({
+      'Accept': 'application/json',
+      'Authorization': 'Bearer $token',
+    });
+    request.fields['branch_id'] = branchId;
+    request.fields['latitude'] = latitude.toString();
+    request.fields['longitude'] = longitude.toString();
+    request.files.add(await http.MultipartFile.fromPath('photo', photo.path));
+
+    final response = await http.Response.fromStream(await request.send());
+    final payload = _decodePayload(response);
+
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return payload['message']?.toString() ??
+          'TE tracker visit recorded successfully.';
+    }
+
+    throw _buildApiException(
+      payload,
+      fallback: 'Unable to record the TE tracker visit right now.',
     );
   }
 
@@ -1398,24 +2881,77 @@ class AppShell extends StatefulWidget {
   State<AppShell> createState() => _AppShellState();
 }
 
-class _AppShellState extends State<AppShell> {
+class _AppShellState extends State<AppShell> with WidgetsBindingObserver {
   final EmployeeApiClient _apiClient = const EmployeeApiClient();
   final EmployeeSessionStore _sessionStore = const EmployeeSessionStore();
 
   String? _token;
   Employee? _employee;
   bool _isRestoringSession = true;
+  StreamSubscription<RemoteMessage>? _pushMessageSubscription;
+  StreamSubscription<RemoteMessage>? _pushMessageOpenedSubscription;
+  StreamSubscription<String>? _pushTokenRefreshSubscription;
+  List<EmployeePushNotification> _adminNotifications =
+      const <EmployeePushNotification>[];
+
+  int get _unreadAdminNotificationCount =>
+      _adminNotifications.where((notification) => !notification.isRead).length;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initializePushMessaging();
     _restoreSession();
+  }
+
+  Future<void> _initializePushMessaging() async {
+    await PushMessagingService.initialize();
+    if (!PushMessagingService.isAvailable) {
+      return;
+    }
+
+    await PushMessagingService.requestPermission();
+    await PushMessagingService.configureForegroundPresentation();
+
+    _pushMessageSubscription = PushMessagingService.onMessage.listen((message) {
+      unawaited(
+        _handleIncomingPushMessage(message, showLocalNotification: true),
+      );
+    });
+    _pushMessageOpenedSubscription = PushMessagingService.onMessageOpenedApp
+        .listen((message) {
+          unawaited(_handleIncomingPushMessage(message));
+        });
+    _pushTokenRefreshSubscription = PushMessagingService.onTokenRefresh.listen((
+      deviceToken,
+    ) {
+      final authToken = _token;
+      if (authToken == null || authToken.isEmpty) {
+        return;
+      }
+
+      unawaited(
+        _apiClient.registerDeviceToken(
+          token: authToken,
+          deviceToken: deviceToken,
+          platform: PushMessagingService.platform,
+        ),
+      );
+    });
+
+    final initialMessage = await PushMessagingService.initialMessage();
+    if (initialMessage != null) {
+      unawaited(_handleIncomingPushMessage(initialMessage));
+    }
   }
 
   Future<void> _restoreSession() async {
     final token = await _sessionStore.readToken();
 
     if (token == null || token.isEmpty) {
+      await AdminNotificationBackgroundService.cancelAll();
+      await AttendanceNotificationService.clearForLogout();
       if (!mounted) {
         return;
       }
@@ -1437,7 +2973,9 @@ class _AppShellState extends State<AppShell> {
     }
 
     try {
-      final employee = await _apiClient.profile(token);
+      final employee = await _apiClient
+          .profile(token)
+          .timeout(const Duration(seconds: 10));
       if (!mounted) {
         return;
       }
@@ -1446,10 +2984,19 @@ class _AppShellState extends State<AppShell> {
         _employee = employee;
         _isRestoringSession = false;
       });
+      await AttendanceNotificationService.syncBranchOpeningReminders(employee);
+      unawaited(_syncCurrentPushToken(token));
+      unawaited(_syncAttendanceForNotifications(token));
+      unawaited(_refreshAdminNotifications(token));
     } catch (_) {
-      final stillHasInternet = await _hasInternetConnection();
+      final stillHasInternet = await _hasInternetConnection().timeout(
+        const Duration(seconds: 4),
+        onTimeout: () => false,
+      );
       if (stillHasInternet) {
         await _sessionStore.clearToken();
+        await AdminNotificationBackgroundService.cancelAll();
+        await AttendanceNotificationService.clearForLogout();
       }
       if (!mounted) {
         return;
@@ -1476,22 +3023,47 @@ class _AppShellState extends State<AppShell> {
       empId: empId,
       rememberCredentials: rememberCredentials,
     );
+    try {
+      await _syncAttendanceForNotifications(auth.token);
+    } catch (_) {
+      // Login should not fail if attendance sync is temporarily unavailable.
+    }
     setState(() {
       _token = auth.token;
       _employee = auth.employee;
+      _adminNotifications = const <EmployeePushNotification>[];
     });
+    await AttendanceNotificationService.syncBranchOpeningReminders(
+      auth.employee,
+    );
+    unawaited(_syncCurrentPushToken(auth.token));
+    unawaited(_refreshAdminNotifications(auth.token));
+  }
+
+  Future<void> _syncAttendanceForNotifications(String token) async {
+    try {
+      final attendance = await _apiClient
+          .latestAttendance(token)
+          .timeout(const Duration(seconds: 6));
+      await AttendanceNotificationService.syncWithAttendance(attendance);
+    } catch (_) {
+      // Attendance notification sync must never block app navigation.
+    }
   }
 
   Future<void> _handleLogout() async {
     final token = _token;
     try {
       if (token != null && token.isNotEmpty) {
+        await _removeCurrentPushToken(token);
         await _apiClient.logout(token);
       }
     } catch (_) {
       // Clear the local session even if the backend is unreachable.
     } finally {
+      await AdminNotificationBackgroundService.cancelAll();
       await _sessionStore.clearToken();
+      await AttendanceNotificationService.clearForLogout();
     }
 
     if (!mounted) {
@@ -1500,6 +3072,7 @@ class _AppShellState extends State<AppShell> {
     setState(() {
       _token = null;
       _employee = null;
+      _adminNotifications = const <EmployeePushNotification>[];
     });
   }
 
@@ -1507,6 +3080,185 @@ class _AppShellState extends State<AppShell> {
     setState(() {
       _employee = employee;
     });
+    unawaited(
+      AttendanceNotificationService.syncBranchOpeningReminders(employee),
+    );
+  }
+
+  Future<void> _handleIncomingPushMessage(
+    RemoteMessage message, {
+    bool showLocalNotification = false,
+  }) async {
+    final isAdminNotification =
+        message.data['type']?.toString() == 'admin_notification';
+    final notification =
+        isAdminNotification
+            ? EmployeePushNotification.fromRemoteMessage(message)
+            : null;
+
+    if (notification != null && notification.deliveryId > 0 && mounted) {
+      setState(() {
+        _adminNotifications = _mergeAdminNotifications(_adminNotifications, [
+          notification,
+        ]);
+      });
+    }
+
+    if (showLocalNotification &&
+        notification != null &&
+        notification.deliveryId > 0) {
+      await AttendanceNotificationService.showAdminNotification(notification);
+    }
+
+    final authToken = _token;
+    if (authToken == null || authToken.isEmpty) {
+      return;
+    }
+
+    unawaited(_refreshAdminNotifications(authToken));
+    unawaited(_syncEmployeeForBranchOpeningReminders(authToken));
+  }
+
+  Future<void> _syncCurrentPushToken(String token) async {
+    if (!PushMessagingService.isAvailable) {
+      return;
+    }
+
+    final deviceToken = await PushMessagingService.currentToken();
+    if (deviceToken == null || deviceToken.isEmpty) {
+      return;
+    }
+
+    try {
+      await _apiClient.registerDeviceToken(
+        token: token,
+        deviceToken: deviceToken,
+        platform: PushMessagingService.platform,
+      );
+    } catch (_) {
+      // Push token sync must never block the employee workflow.
+    }
+  }
+
+  Future<void> _removeCurrentPushToken(String token) async {
+    if (!PushMessagingService.isAvailable) {
+      return;
+    }
+
+    final deviceToken = await PushMessagingService.currentToken();
+    if (deviceToken == null || deviceToken.isEmpty) {
+      return;
+    }
+
+    try {
+      await _apiClient.removeDeviceToken(token: token, deviceToken: deviceToken);
+    } catch (_) {
+      // Token removal is best-effort during logout.
+    }
+  }
+
+  Future<void> _syncEmployeeForBranchOpeningReminders(String token) async {
+    try {
+      final employee = await _apiClient
+          .profile(token)
+          .timeout(const Duration(seconds: 8));
+      await AttendanceNotificationService.syncBranchOpeningReminders(employee);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _employee = employee;
+      });
+    } catch (_) {
+      // Reminder sync must not interrupt notification polling.
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+
+    final token = _token;
+    if (token == null || token.isEmpty || _employee == null) {
+      return;
+    }
+
+    switch (state) {
+      case AppLifecycleState.resumed:
+        unawaited(_syncCurrentPushToken(token));
+        unawaited(_refreshAdminNotifications(token));
+        break;
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        break;
+    }
+  }
+
+  Future<void> _refreshAdminNotifications(String token) async {
+    try {
+      final notifications = await _apiClient
+          .notifications(token: token)
+          .timeout(const Duration(seconds: 8));
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _adminNotifications = _mergeAdminNotifications(
+          _adminNotifications,
+          notifications,
+        );
+      });
+    } catch (_) {
+      // Notification history should not interrupt the employee workflow.
+    }
+  }
+
+  Future<void> _handleAdminNotificationsViewed() async {
+    final token = _token;
+    final unreadDeliveryIds = _adminNotifications
+        .where((notification) => !notification.isRead)
+        .map((notification) => notification.deliveryId)
+        .toList();
+
+    if (unreadDeliveryIds.isEmpty) {
+      return;
+    }
+
+    final readAt = DateTime.now().toIso8601String();
+    setState(() {
+      _adminNotifications = _adminNotifications
+          .map(
+            (notification) =>
+                unreadDeliveryIds.contains(notification.deliveryId)
+                ? notification.copyWith(readAt: readAt)
+                : notification,
+          )
+          .toList();
+    });
+
+    if (token == null || token.isEmpty) {
+      return;
+    }
+
+    try {
+      await _apiClient.markNotificationsRead(
+        token: token,
+        deliveryIds: unreadDeliveryIds,
+      );
+    } catch (_) {
+      // Keep the bell cleared locally; the next refresh can reconcile state.
+    }
+  }
+
+  @override
+  void dispose() {
+    _pushMessageSubscription?.cancel();
+    _pushMessageOpenedSubscription?.cancel();
+    _pushTokenRefreshSubscription?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
   @override
@@ -1520,10 +3272,34 @@ class _AppShellState extends State<AppShell> {
         : DashboardScreen(
             employee: _employee!,
             token: _token!,
+            notifications: _adminNotifications,
+            unreadNotificationCount: _unreadAdminNotificationCount,
             onLogout: _handleLogout,
             onEmployeeUpdated: _handleEmployeeUpdated,
+            onNotificationsViewed: _handleAdminNotificationsViewed,
           );
   }
+}
+
+List<EmployeePushNotification> _mergeAdminNotifications(
+  List<EmployeePushNotification> current,
+  List<EmployeePushNotification> incoming,
+) {
+  final byDeliveryId = <int, EmployeePushNotification>{
+    for (final notification in current) notification.deliveryId: notification,
+  };
+
+  for (final notification in incoming) {
+    final existing = byDeliveryId[notification.deliveryId];
+    byDeliveryId[notification.deliveryId] =
+        existing != null && existing.isRead && !notification.isRead
+        ? existing
+        : notification;
+  }
+
+  final merged = byDeliveryId.values.toList()
+    ..sort((left, right) => right.deliveryId.compareTo(left.deliveryId));
+  return merged;
 }
 
 class _SessionBootstrapScreen extends StatelessWidget {
@@ -2164,10 +3940,19 @@ class _MyAttendancePageState extends State<MyAttendancePage> {
     return '${now.year}-$month-$day';
   }
 
-  bool get _hasTodayAttendance => _attendance?.checkInDate == _todayDate;
+  bool get _hasTodayAttendance =>
+      _attendance != null &&
+      (_attendance?.checkInDate == _todayDate ||
+          (_isNightShiftAttendance && !(_attendance?.hasCheckedOut ?? true)));
 
   bool get _hasActiveAttendance =>
-      _hasTodayAttendance && !(_attendance?.hasCheckedOut ?? false);
+      _attendance != null &&
+      (_attendance?.checkInDate == _todayDate || _isNightShiftAttendance) &&
+      !(_attendance?.hasCheckedOut ?? false);
+
+  bool get _isNightShiftAttendance =>
+      _attendance != null &&
+      (_attendance?.isNightShift == true || widget.employee.isNightShift);
 
   bool get _hasBranchCoordinates =>
       widget.employee.branchLatitude != null &&
@@ -2283,7 +4068,9 @@ class _MyAttendancePageState extends State<MyAttendancePage> {
 
   String get _statusText {
     if (_hasActiveAttendance) {
-      return 'Checked in today at ${_attendance!.checkInTime}.';
+      return _isNightShiftAttendance && _attendance!.checkInDate != _todayDate
+          ? 'Night shift check-in active from ${_attendance!.checkInDate} at ${_attendance!.checkInTime}.'
+          : 'Checked in today at ${_attendance!.checkInTime}.';
     }
     if (_hasTodayAttendance) {
       return 'Today attendance completed at ${_attendance!.checkOutTime ?? '-'}';
@@ -2349,6 +4136,7 @@ class _MyAttendancePageState extends State<MyAttendancePage> {
           _checkOutPhoto = null;
         }
       });
+      await AttendanceNotificationService.syncWithAttendance(attendance);
     } on ApiException catch (error) {
       if (!mounted) {
         return;
@@ -2643,6 +4431,10 @@ class _MyAttendancePageState extends State<MyAttendancePage> {
         _checkOutPhoto = null;
         _fakeLocationIssue = null;
       });
+      await AttendanceNotificationService.markCheckInCompleted();
+      if (!mounted) {
+        return;
+      }
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Attendance checked in successfully.')),
@@ -2725,6 +4517,10 @@ class _MyAttendancePageState extends State<MyAttendancePage> {
         _checkOutPhoto = null;
         _fakeLocationIssue = null;
       });
+      await AttendanceNotificationService.markCheckOutCompleted();
+      if (!mounted) {
+        return;
+      }
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Attendance checked out successfully.')),
@@ -3169,19 +4965,37 @@ class DashboardScreen extends StatelessWidget {
     super.key,
     required this.employee,
     required this.token,
+    required this.notifications,
+    required this.unreadNotificationCount,
     required this.onLogout,
     required this.onEmployeeUpdated,
+    required this.onNotificationsViewed,
   });
 
   final Employee employee;
   final String token;
+  final List<EmployeePushNotification> notifications;
+  final int unreadNotificationCount;
   final Future<void> Function() onLogout;
   final ValueChanged<Employee> onEmployeeUpdated;
+  final Future<void> Function() onNotificationsViewed;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final shortcuts = [
+    final now = DateTime.now();
+    final birthdayDate = _parseYmdDate(employee.dateOfBirth);
+    final isBirthdayToday =
+        birthdayDate != null &&
+        birthdayDate.month == now.month &&
+        birthdayDate.day == now.day;
+    final headerTextColor = isBirthdayToday
+        ? const Color(0xFF4B1F73)
+        : AppColors.text;
+    final headerSubtleColor = isBirthdayToday
+        ? const Color(0xFF7A5670)
+        : AppColors.subtleText;
+    final shortcuts = <DashboardShortcut>[
       DashboardShortcut(
         title: 'My Attendance',
         icon: Icons.fingerprint,
@@ -3261,6 +5075,44 @@ class DashboardScreen extends StatelessWidget {
           );
         },
       ),
+      if (_isTeDesignation(employee.designation))
+        DashboardShortcut(
+          title: 'TE Tracker',
+          icon: Icons.route_rounded,
+          highlight: false,
+          onTap: () {
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => TeTrackerPage(
+                  employee: employee,
+                  token: token,
+                  apiClient: const EmployeeApiClient(),
+                ),
+              ),
+            );
+          },
+        ),
+      DashboardShortcut(
+        title: 'Notifications',
+        icon: unreadNotificationCount > 0
+            ? Icons.notifications_active_rounded
+            : Icons.notifications_none_rounded,
+        highlight: unreadNotificationCount > 0,
+        glow: unreadNotificationCount > 0,
+        badgeCount: unreadNotificationCount,
+        onTap: () {
+          Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => NotificationsPage(
+                token: token,
+                apiClient: const EmployeeApiClient(),
+                initialNotifications: notifications,
+                onNotificationsViewed: onNotificationsViewed,
+              ),
+            ),
+          );
+        },
+      ),
       DashboardShortcut(
         title: 'My Profile',
         icon: Icons.badge_outlined,
@@ -3286,82 +5138,196 @@ class DashboardScreen extends StatelessWidget {
     ];
 
     return Scaffold(
-      body: SafeArea(
-        child: CustomScrollView(
-          slivers: [
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        _EmployeeAvatar(
-                          employee: employee,
-                          size: 54,
-                          textStyle: theme.textTheme.titleLarge?.copyWith(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w800,
-                          ),
-                        ),
-                        const SizedBox(width: 14),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                employee.name,
-                                style: theme.textTheme.headlineMedium?.copyWith(
-                                  color: AppColors.text,
-                                  fontWeight: FontWeight.w800,
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: isBirthdayToday
+                    ? const LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          Color(0xFFFFF7E8),
+                          Color(0xFFFFE8D4),
+                          AppColors.background,
+                          AppColors.background,
+                        ],
+                        stops: [0.0, 0.24, 0.24, 1.0],
+                      )
+                    : null,
+                color: isBirthdayToday ? null : AppColors.background,
+              ),
+              child: SafeArea(
+                child: CustomScrollView(
+                  slivers: [
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                _EmployeeAvatar(
+                                  employee: employee,
+                                  size: 54,
+                                  textStyle: theme.textTheme.titleLarge
+                                      ?.copyWith(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w800,
+                                      ),
                                 ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              Text(
-                                'Emp ID: ${employee.empId}',
-                                style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: AppColors.subtleText,
+                                const SizedBox(width: 14),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        employee.name,
+                                        style: theme.textTheme.headlineMedium
+                                            ?.copyWith(
+                                              color: headerTextColor,
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      Text(
+                                        'Emp ID: ${employee.empId}',
+                                        style: theme.textTheme.bodyMedium
+                                            ?.copyWith(
+                                              color: headerSubtleColor,
+                                            ),
+                                      ),
+                                      Text(
+                                        'Branch ID: ${employee.branchId} • ${employee.branchName.isNotEmpty ? employee.branchName : 'Branch name unavailable'}',
+                                        style: theme.textTheme.bodySmall
+                                            ?.copyWith(
+                                              color: headerSubtleColor,
+                                            ),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                IconButton.filledTonal(
+                                  onPressed: onLogout,
+                                  style: IconButton.styleFrom(
+                                    backgroundColor: isBirthdayToday
+                                        ? const Color(0x33FFFFFF)
+                                        : null,
+                                    foregroundColor: isBirthdayToday
+                                        ? const Color(0xFF4B1F73)
+                                        : AppColors.secondary,
+                                  ),
+                                  icon: const Icon(Icons.logout_rounded),
+                                ),
+                              ],
+                            ),
+                            if (isBirthdayToday) ...[
+                              const SizedBox(height: 16),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(22),
+                                  gradient: const LinearGradient(
+                                    begin: Alignment.topLeft,
+                                    end: Alignment.bottomRight,
+                                    colors: [
+                                      Color(0xFFFFA06A),
+                                      Color(0xFFFF6D8E),
+                                      Color(0xFF6F40D8),
+                                    ],
+                                  ),
+                                  boxShadow: const [
+                                    BoxShadow(
+                                      color: Color(0x1F8D275A),
+                                      blurRadius: 26,
+                                      offset: Offset(0, 14),
+                                    ),
+                                  ],
+                                ),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Container(
+                                      width: 44,
+                                      height: 44,
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.2,
+                                        ),
+                                        shape: BoxShape.circle,
+                                      ),
+                                      alignment: Alignment.center,
+                                      child: const Icon(
+                                        Icons.cake_rounded,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 14),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Happy Birthday',
+                                            style: theme.textTheme.titleMedium
+                                                ?.copyWith(
+                                                  color: Colors.white,
+                                                  fontWeight: FontWeight.w800,
+                                                ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            'Wishing you joy, good health, and a fantastic year ahead.',
+                                            style: theme.textTheme.bodySmall
+                                                ?.copyWith(
+                                                  color: Colors.white
+                                                      .withValues(alpha: 0.88),
+                                                  height: 1.45,
+                                                ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ),
-                              Text(
-                                'Branch ID: ${employee.branchId} • ${employee.branchName.isNotEmpty ? employee.branchName : 'Branch name unavailable'}',
-                                style: theme.textTheme.bodySmall?.copyWith(
-                                  color: AppColors.subtleText,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ],
-                          ),
+                            ] else
+                              const SizedBox(height: 8),
+                          ],
                         ),
-                        IconButton.filledTonal(
-                          onPressed: onLogout,
-                          icon: const Icon(Icons.logout_rounded),
-                        ),
-                      ],
+                      ),
                     ),
-                    const SizedBox(height: 8),
+                    SliverPadding(
+                      padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+                      sliver: SliverList(
+                        delegate: SliverChildBuilderDelegate((context, index) {
+                          return Padding(
+                            padding: EdgeInsets.only(
+                              bottom: index == shortcuts.length - 1 ? 0 : 14,
+                            ),
+                            child: _ShortcutCard(item: shortcuts[index]),
+                          );
+                        }, childCount: shortcuts.length),
+                      ),
+                    ),
                   ],
                 ),
               ),
             ),
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
-              sliver: SliverList(
-                delegate: SliverChildBuilderDelegate((context, index) {
-                  return Padding(
-                    padding: EdgeInsets.only(
-                      bottom: index == shortcuts.length - 1 ? 0 : 14,
-                    ),
-                    child: _ShortcutCard(item: shortcuts[index]),
-                  );
-                }, childCount: shortcuts.length),
-              ),
+          ),
+          if (isBirthdayToday)
+            const Positioned.fill(
+              child: IgnorePointer(child: _BirthdayBurstOverlay()),
             ),
-          ],
-        ),
+        ],
       ),
     );
   }
@@ -3999,7 +5965,9 @@ class _SiteVisitRequestPageState extends State<SiteVisitRequestPage> {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unable to open settings on this device.')),
+        const SnackBar(
+          content: Text('Unable to open settings on this device.'),
+        ),
       );
     }
   }
@@ -4393,6 +6361,592 @@ class _SiteVisitRequestPageState extends State<SiteVisitRequestPage> {
   }
 }
 
+class TeTrackerPage extends StatefulWidget {
+  const TeTrackerPage({
+    super.key,
+    required this.employee,
+    required this.token,
+    required this.apiClient,
+  });
+
+  final Employee employee;
+  final String token;
+  final EmployeeApiClient apiClient;
+
+  @override
+  State<TeTrackerPage> createState() => _TeTrackerPageState();
+}
+
+class _TeTrackerPageState extends State<TeTrackerPage> {
+  List<TeTrackerBranch> _branches = const <TeTrackerBranch>[];
+  TeTrackerHistoryResponse? _history;
+  String? _selectedBranchId;
+  Position? _position;
+  File? _photo;
+  bool _isLoading = true;
+  bool _isFetchingLocation = false;
+  bool _isPickingPhoto = false;
+  bool _isSubmitting = false;
+  String? _errorText;
+  FakeLocationIssue? _fakeLocationIssue;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializePage();
+  }
+
+  Future<void> _initializePage() async {
+    await _loadTrackerData();
+    if (!mounted) {
+      return;
+    }
+
+    _fetchLocation(silent: true);
+  }
+
+  TeTrackerBranch? get _selectedBranch {
+    final selectedBranchId = (_selectedBranchId ?? '').trim();
+    if (selectedBranchId.isEmpty) {
+      return null;
+    }
+
+    for (final branch in _branches) {
+      if (branch.branchId == selectedBranchId) {
+        return branch;
+      }
+    }
+
+    return null;
+  }
+
+  double? get _distanceFromSelectedBranchMeters {
+    final position = _position;
+    final selectedBranch = _selectedBranch;
+
+    if (position == null ||
+        selectedBranch == null ||
+        selectedBranch.latitude == null ||
+        selectedBranch.longitude == null) {
+      return null;
+    }
+
+    return Geolocator.distanceBetween(
+      position.latitude,
+      position.longitude,
+      selectedBranch.latitude!,
+      selectedBranch.longitude!,
+    );
+  }
+
+  Future<void> _loadTrackerData({bool showLoader = true}) async {
+    if (showLoader) {
+      setState(() {
+        _isLoading = true;
+        _errorText = null;
+      });
+    }
+
+    try {
+      final branches = await widget.apiClient.teTrackerBranches(
+        token: widget.token,
+      );
+      final history = await widget.apiClient.teTrackerVisits(
+        token: widget.token,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      final existingSelection = (_selectedBranchId ?? '').trim();
+      final hasExistingSelection = branches.any(
+        (branch) => branch.branchId == existingSelection,
+      );
+      final lastVisitedBranchId = history.visits.isNotEmpty
+          ? history.visits.last.branchId.trim()
+          : '';
+      final hasLastVisitedBranch = branches.any(
+        (branch) => branch.branchId == lastVisitedBranchId,
+      );
+
+      setState(() {
+        _branches = branches;
+        _history = history;
+        _selectedBranchId = hasExistingSelection
+            ? existingSelection
+            : hasLastVisitedBranch
+            ? lastVisitedBranchId
+            : branches.isNotEmpty
+            ? branches.first.branchId
+            : null;
+        _errorText = null;
+      });
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _errorText = error.message;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _errorText = 'Unable to load TE tracker details right now.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _fetchLocation({bool silent = false}) async {
+    setState(() {
+      _isFetchingLocation = true;
+      _position = null;
+      _fakeLocationIssue = null;
+      if (!silent) {
+        _errorText = null;
+      }
+    });
+
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        throw ApiException('Location services are disabled.');
+      }
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        throw ApiException('Location permission is required for TE tracker.');
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      );
+      await LocationIntegrityService.ensureTrustedPosition(
+        position,
+        actionLabel: 'recording the TE tracker visit',
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _position = position;
+        _fakeLocationIssue = null;
+      });
+    } on FakeLocationException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _position = null;
+        _fakeLocationIssue = error.issue;
+        _errorText = error.message;
+      });
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _position = null;
+        _fakeLocationIssue = null;
+        _errorText = error.message;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _position = null;
+        _fakeLocationIssue = null;
+        _errorText = 'Unable to fetch current location.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isFetchingLocation = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _capturePhoto() async {
+    setState(() {
+      _isPickingPhoto = true;
+    });
+
+    try {
+      final image = await Navigator.of(context).push<File>(
+        MaterialPageRoute<File>(
+          builder: (_) => const FrontCameraCapturePage(
+            title: 'TE Tracker Photo',
+            subtitle:
+                'Use the selfie camera only. The back camera is disabled in this app.',
+          ),
+          fullscreenDialog: true,
+        ),
+      );
+
+      if (image == null || !mounted) {
+        return;
+      }
+
+      setState(() {
+        _photo = image;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isPickingPhoto = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openFakeLocationSettings() async {
+    final issue = _fakeLocationIssue;
+    if (issue == null) {
+      return;
+    }
+
+    try {
+      await LocationIntegrityService.openIssueSettings(issue);
+    } on PlatformException {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Unable to open settings on this device.'),
+        ),
+      );
+    }
+  }
+
+  Future<void> _submit() async {
+    final selectedBranch = _selectedBranch;
+    if (selectedBranch == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Select the branch you reached first.')),
+      );
+      return;
+    }
+
+    if (_photo == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Capture a TE tracker photo first.')),
+      );
+      return;
+    }
+
+    if (_position == null) {
+      await _fetchLocation();
+    }
+
+    final position = _position;
+    if (position == null) {
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _isSubmitting = true;
+      _fakeLocationIssue = null;
+      _errorText = null;
+    });
+
+    try {
+      final message = await widget.apiClient.teTrackerCheckIn(
+        token: widget.token,
+        branchId: selectedBranch.branchId,
+        latitude: position.latitude,
+        longitude: position.longitude,
+        photo: _photo!,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _photo = null;
+        _fakeLocationIssue = null;
+      });
+
+      await _loadTrackerData(showLoader: false);
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    } on FakeLocationException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fakeLocationIssue = error.issue;
+        _errorText = error.message;
+      });
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fakeLocationIssue = null;
+        _errorText = error.message;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fakeLocationIssue = null;
+        _errorText = 'Unable to record the TE tracker visit.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSubmitting = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final history = _history;
+    final selectedBranch = _selectedBranch;
+    final distance = _distanceFromSelectedBranchMeters;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('TE Tracker'),
+        surfaceTintColor: Colors.transparent,
+        backgroundColor: AppColors.background,
+        actions: [
+          IconButton(
+            onPressed: _isLoading
+                ? null
+                : () => _loadTrackerData(showLoader: true),
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
+      body: _isLoading && history == null && _branches.isEmpty
+          ? const Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 28),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const _InsightBanner(
+                    title: 'Track every branch visit',
+                    subtitle:
+                        'Select the branch you reached, capture GPS and a selfie, and record the TE travel path for today.',
+                  ),
+                  if (_errorText != null) ...[
+                    const SizedBox(height: 16),
+                    _InlineInfoCard(
+                      backgroundColor: const Color(0xFFFFE7E7),
+                      icon: Icons.error_outline_rounded,
+                      iconColor: const Color(0xFFD84A4A),
+                      title: 'TE tracker needs attention',
+                      subtitle: _errorText!,
+                      titleColor: const Color(0xFF9A1B1B),
+                      subtitleColor: const Color(0xFF9A1B1B),
+                      action: _fakeLocationIssue == null
+                          ? null
+                          : TextButton.icon(
+                              onPressed: _openFakeLocationSettings,
+                              icon: const Icon(Icons.settings_outlined),
+                              label: Text(_fakeLocationIssue!.actionLabel),
+                            ),
+                    ),
+                  ],
+                  const SizedBox(height: 18),
+                  _LabeledField(
+                    label: 'Reached Branch',
+                    child: DropdownButtonFormField<String>(
+                      initialValue: selectedBranch?.branchId,
+                      decoration: _fieldDecoration(
+                        hintText: 'Select the branch you reached',
+                        prefixIcon: Icons.apartment_rounded,
+                      ),
+                      items: _branches
+                          .map(
+                            (branch) => DropdownMenuItem<String>(
+                              value: branch.branchId,
+                              child: Text(
+                                branch.label,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: _isSubmitting
+                          ? null
+                          : (value) {
+                              setState(() {
+                                _selectedBranchId = value;
+                              });
+                            },
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _InlineInfoCard(
+                    backgroundColor: AppColors.surface,
+                    icon: Icons.my_location_rounded,
+                    iconColor: AppColors.primary,
+                    title: _position == null
+                        ? 'Current GPS not captured yet'
+                        : '${_position!.latitude.toStringAsFixed(6)}, ${_position!.longitude.toStringAsFixed(6)}',
+                    subtitle: _isFetchingLocation
+                        ? 'Fetching your current GPS position.'
+                        : selectedBranch == null
+                        ? 'Choose a branch to compare your distance from it.'
+                        : selectedBranch.latitude == null ||
+                              selectedBranch.longitude == null
+                        ? 'Selected branch coordinates are unavailable.'
+                        : distance == null
+                        ? 'Current distance to ${selectedBranch.label} will appear here.'
+                        : 'Current distance to ${selectedBranch.label}: ${_formatDistanceMeters(distance)}',
+                    action: TextButton(
+                      onPressed: _isFetchingLocation
+                          ? null
+                          : () => _fetchLocation(silent: false),
+                      child: Text(
+                        _isFetchingLocation ? 'Fetching...' : 'Use Current GPS',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _InlineInfoCard(
+                    backgroundColor: AppColors.surface,
+                    icon: Icons.camera_alt_outlined,
+                    iconColor: AppColors.primary,
+                    title: _photo == null
+                        ? 'TE tracker photo not captured yet'
+                        : 'Photo ready to upload',
+                    subtitle: _photo == null
+                        ? 'Capture a selfie at the branch before recording the visit.'
+                        : _photo!.path.split(Platform.pathSeparator).last,
+                    action: TextButton(
+                      onPressed: _isPickingPhoto ? null : _capturePhoto,
+                      child: Text(
+                        _isPickingPhoto ? 'Opening...' : 'Capture Photo',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: _isSubmitting ? null : _submit,
+                      icon: _isSubmitting
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.route_rounded),
+                      label: Text(
+                        _isSubmitting
+                            ? 'Recording visit...'
+                            : 'Record TE Tracker Visit',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  const _SectionTitle(title: 'Today\'s Route'),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    children: [
+                      _TeTrackerMetricCard(
+                        label: 'Visits',
+                        value: '${history?.summary.totalVisits ?? 0}',
+                      ),
+                      _TeTrackerMetricCard(
+                        label: 'Unique Branches',
+                        value: '${history?.summary.uniqueBranches ?? 0}',
+                      ),
+                      _TeTrackerMetricCard(
+                        label: 'Distance',
+                        value: history?.summary.totalDistanceLabel ?? '0 m',
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  _InlineInfoCard(
+                    backgroundColor: AppColors.surface,
+                    icon: Icons.timeline_rounded,
+                    iconColor: AppColors.primary,
+                    title:
+                        'Start: ${history?.summary.startBranchLabel ?? 'No visits'}',
+                    subtitle:
+                        'End: ${history?.summary.endBranchLabel ?? 'No visits'}',
+                  ),
+                  const SizedBox(height: 18),
+                  _RequestHistoryHeader(
+                    title: 'Recorded branch visits',
+                    onRefresh: _isLoading
+                        ? null
+                        : () => _loadTrackerData(showLoader: true),
+                  ),
+                  const SizedBox(height: 12),
+                  if (history == null || history.visits.isEmpty)
+                    const _EmptyRequestState(
+                      message:
+                          'Your TE route for today will appear here after you start recording branch visits.',
+                    )
+                  else
+                    Column(
+                      children: history.visits
+                          .map(
+                            (visit) => Padding(
+                              padding: const EdgeInsets.only(bottom: 12),
+                              child: _TeTrackerVisitCard(visit: visit),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                ],
+              ),
+            ),
+    );
+  }
+}
+
 class _RequestHistoryHeader extends StatelessWidget {
   const _RequestHistoryHeader({required this.title, this.onRefresh});
 
@@ -4600,6 +7154,150 @@ class _SiteVisitRequestHistoryCard extends StatelessWidget {
   }
 }
 
+class _TeTrackerMetricCard extends StatelessWidget {
+  const _TeTrackerMetricCard({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(minWidth: 120),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x12000000),
+            blurRadius: 16,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: AppColors.subtleText,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            value,
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+              color: AppColors.text,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TeTrackerVisitCard extends StatelessWidget {
+  const _TeTrackerVisitCard({required this.visit});
+
+  final TeTrackerVisitRecord visit;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x12000000),
+            blurRadius: 16,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  '${visit.sequence}',
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    color: AppColors.primary,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      visit.branchLabel,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        color: AppColors.text,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${_formatIsoDate(visit.visitDate)} at ${visit.visitTime}',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: AppColors.subtleText,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _RequestHistoryLine(
+            label: 'Distance From Branch',
+            value: visit.distanceFromBranchLabel,
+          ),
+          const SizedBox(height: 6),
+          _RequestHistoryLine(
+            label: 'Distance From Previous',
+            value: visit.distanceFromPreviousLabel,
+          ),
+          const SizedBox(height: 6),
+          _RequestHistoryLine(
+            label: 'Cumulative Distance',
+            value: visit.cumulativeDistanceLabel,
+          ),
+          const SizedBox(height: 6),
+          _RequestHistoryLine(
+            label: 'Captured Location',
+            value:
+                visit.capturedLatitude != null &&
+                    visit.capturedLongitude != null
+                ? '${visit.capturedLatitude!.toStringAsFixed(6)}, ${visit.capturedLongitude!.toStringAsFixed(6)}'
+                : 'Location unavailable',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _RequestHistoryLine extends StatelessWidget {
   const _RequestHistoryLine({required this.label, required this.value});
 
@@ -4667,10 +7365,12 @@ class _ProfilePageState extends State<ProfilePage> {
   late final TextEditingController _phoneController;
   late final TextEditingController _emailController;
   late final TextEditingController _addressController;
+  late final TextEditingController _dateOfBirthController;
   bool _isUploadingPhoto = false;
   bool _isSavingProfile = false;
   String? _selectedGender;
   String? _selectedMaritalStatus;
+  DateTime? _selectedDateOfBirth;
 
   @override
   void initState() {
@@ -4680,6 +7380,7 @@ class _ProfilePageState extends State<ProfilePage> {
     _phoneController = TextEditingController();
     _emailController = TextEditingController();
     _addressController = TextEditingController();
+    _dateOfBirthController = TextEditingController();
     _syncFormWithEmployee(_employee);
   }
 
@@ -4689,6 +7390,7 @@ class _ProfilePageState extends State<ProfilePage> {
     _phoneController.dispose();
     _emailController.dispose();
     _addressController.dispose();
+    _dateOfBirthController.dispose();
     super.dispose();
   }
 
@@ -4697,11 +7399,36 @@ class _ProfilePageState extends State<ProfilePage> {
     _phoneController.text = employee.contact;
     _emailController.text = employee.mailId;
     _addressController.text = employee.address;
+    _selectedDateOfBirth = _parseYmdDate(employee.dateOfBirth);
+    _dateOfBirthController.text = _selectedDateOfBirth == null
+        ? ''
+        : _formatDisplayDate(_selectedDateOfBirth!);
     _selectedGender = _matchOption(employee.gender, _genderOptions);
     _selectedMaritalStatus = _matchOption(
       employee.maritalStatus,
       _maritalStatusOptions,
     );
+  }
+
+  Future<void> _pickDateOfBirth() async {
+    final now = DateTime.now();
+    final initialDate =
+        _selectedDateOfBirth ?? DateTime(now.year - 21, now.month, now.day);
+    final selected = await showDatePicker(
+      context: context,
+      initialDate: initialDate.isAfter(now) ? now : initialDate,
+      firstDate: DateTime(1950, 1, 1),
+      lastDate: now,
+    );
+
+    if (selected == null || !mounted) {
+      return;
+    }
+
+    setState(() {
+      _selectedDateOfBirth = selected;
+      _dateOfBirthController.text = _formatDisplayDate(selected);
+    });
   }
 
   void _applyEmployee(Employee employee, {bool syncForm = true}) {
@@ -4870,6 +7597,7 @@ class _ProfilePageState extends State<ProfilePage> {
         contact: _phoneController.text.trim(),
         mailId: _emailController.text.trim(),
         address: _addressController.text.trim(),
+        dateOfBirth: _formatApiDate(_selectedDateOfBirth),
         gender: (_selectedGender ?? '').trim(),
         maritalStatus: (_selectedMaritalStatus ?? '').trim(),
       );
@@ -5176,60 +7904,101 @@ class _ProfilePageState extends State<ProfilePage> {
                       ),
                     ),
                     const SizedBox(height: 14),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: _LabeledField(
-                            label: 'Gender',
-                            child: DropdownButtonFormField<String>(
-                              initialValue: _selectedGender,
-                              items: genderOptions
-                                  .map(
-                                    (option) => DropdownMenuItem<String>(
-                                      value: option,
-                                      child: Text(option),
-                                    ),
-                                  )
-                                  .toList(),
-                              onChanged: (value) {
-                                setState(() {
-                                  _selectedGender = value;
-                                });
-                              },
-                              decoration: _fieldDecoration(
-                                hintText: 'Select Gender',
-                                prefixIcon: Icons.wc_rounded,
-                              ),
-                            ),
+                    _LabeledField(
+                      label: 'Date of Birth',
+                      child: TextFormField(
+                        controller: _dateOfBirthController,
+                        readOnly: true,
+                        onTap: _pickDateOfBirth,
+                        decoration: _fieldDecoration(
+                          hintText: 'Select your date of birth',
+                          prefixIcon: Icons.cake_outlined,
+                          suffixIcon: IconButton(
+                            onPressed: _pickDateOfBirth,
+                            icon: const Icon(Icons.calendar_month_rounded),
                           ),
                         ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: _LabeledField(
-                            label: 'Marital Status',
-                            child: DropdownButtonFormField<String>(
-                              initialValue: _selectedMaritalStatus,
-                              items: maritalStatusOptions
-                                  .map(
-                                    (option) => DropdownMenuItem<String>(
-                                      value: option,
-                                      child: Text(option),
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    LayoutBuilder(
+                      builder: (context, constraints) {
+                        final useVerticalLayout = constraints.maxWidth < 420;
+
+                        final genderField = _LabeledField(
+                          label: 'Gender',
+                          child: DropdownButtonFormField<String>(
+                            initialValue: _selectedGender,
+                            isExpanded: true,
+                            items: genderOptions
+                                .map(
+                                  (option) => DropdownMenuItem<String>(
+                                    value: option,
+                                    child: Text(
+                                      option,
+                                      overflow: TextOverflow.ellipsis,
                                     ),
-                                  )
-                                  .toList(),
-                              onChanged: (value) {
-                                setState(() {
-                                  _selectedMaritalStatus = value;
-                                });
-                              },
-                              decoration: _fieldDecoration(
-                                hintText: 'Select Marital Status',
-                                prefixIcon: Icons.favorite_border_rounded,
-                              ),
+                                  ),
+                                )
+                                .toList(),
+                            onChanged: (value) {
+                              setState(() {
+                                _selectedGender = value;
+                              });
+                            },
+                            decoration: _fieldDecoration(
+                              hintText: 'Select Gender',
+                              prefixIcon: Icons.wc_rounded,
                             ),
                           ),
-                        ),
-                      ],
+                        );
+
+                        final maritalStatusField = _LabeledField(
+                          label: 'Marital Status',
+                          child: DropdownButtonFormField<String>(
+                            initialValue: _selectedMaritalStatus,
+                            isExpanded: true,
+                            items: maritalStatusOptions
+                                .map(
+                                  (option) => DropdownMenuItem<String>(
+                                    value: option,
+                                    child: Text(
+                                      option,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                )
+                                .toList(),
+                            onChanged: (value) {
+                              setState(() {
+                                _selectedMaritalStatus = value;
+                              });
+                            },
+                            decoration: _fieldDecoration(
+                              hintText: 'Select Marital Status',
+                              prefixIcon: Icons.favorite_border_rounded,
+                            ),
+                          ),
+                        );
+
+                        if (useVerticalLayout) {
+                          return Column(
+                            children: [
+                              genderField,
+                              const SizedBox(height: 14),
+                              maritalStatusField,
+                            ],
+                          );
+                        }
+
+                        return Row(
+                          children: [
+                            Expanded(child: genderField),
+                            const SizedBox(width: 12),
+                            Expanded(child: maritalStatusField),
+                          ],
+                        );
+                      },
                     ),
                     const SizedBox(height: 14),
                     _LabeledField(
@@ -5291,12 +8060,14 @@ class _ProfilePageState extends State<ProfilePage> {
                   value: _stringOrFallback(employee.designation),
                 ),
                 _ProfileEntry(
-                  label: 'Status',
-                  value: _stringOrFallback(employee.status),
+                  label: 'Date of Birth',
+                  value: _stringOrFallback(
+                    _formatDisplayDate(_parseYmdDate(employee.dateOfBirth)),
+                  ),
                 ),
                 _ProfileEntry(
-                  label: 'Work Location',
-                  value: _stringOrFallback(employee.location),
+                  label: 'Status',
+                  value: _stringOrFallback(employee.status),
                 ),
               ],
             ),
@@ -5318,6 +8089,320 @@ class _ProfilePageState extends State<ProfilePage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class NotificationsPage extends StatefulWidget {
+  const NotificationsPage({
+    super.key,
+    required this.token,
+    required this.apiClient,
+    required this.initialNotifications,
+    required this.onNotificationsViewed,
+  });
+
+  final String token;
+  final EmployeeApiClient apiClient;
+  final List<EmployeePushNotification> initialNotifications;
+  final Future<void> Function() onNotificationsViewed;
+
+  @override
+  State<NotificationsPage> createState() => _NotificationsPageState();
+}
+
+class _NotificationsPageState extends State<NotificationsPage> {
+  late List<EmployeePushNotification> _notifications;
+  bool _isLoading = false;
+  String? _errorText;
+
+  @override
+  void initState() {
+    super.initState();
+    final openedAt = DateTime.now().toIso8601String();
+    _notifications = widget.initialNotifications
+        .map(
+          (notification) => notification.isRead
+              ? notification
+              : notification.copyWith(readAt: openedAt),
+        )
+        .toList();
+    _isLoading = _notifications.isEmpty;
+    unawaited(_markViewedAndLoad());
+  }
+
+  Future<void> _markViewedAndLoad() async {
+    await widget.onNotificationsViewed();
+    await _loadNotifications(showLoader: _notifications.isEmpty);
+  }
+
+  Future<void> _loadNotifications({bool showLoader = false}) async {
+    if (showLoader) {
+      setState(() {
+        _isLoading = true;
+        _errorText = null;
+      });
+    }
+
+    try {
+      final notifications = await widget.apiClient
+          .notifications(token: widget.token)
+          .timeout(const Duration(seconds: 8));
+      final unreadDeliveryIds = notifications
+          .where((notification) => !notification.isRead)
+          .map((notification) => notification.deliveryId)
+          .toList();
+      final readAt = DateTime.now().toIso8601String();
+      final visibleNotifications = notifications
+          .map(
+            (notification) =>
+                unreadDeliveryIds.contains(notification.deliveryId)
+                ? notification.copyWith(readAt: readAt)
+                : notification,
+          )
+          .toList();
+
+      if (unreadDeliveryIds.isNotEmpty) {
+        unawaited(() async {
+          try {
+            await widget.apiClient.markNotificationsRead(
+              token: widget.token,
+              deliveryIds: unreadDeliveryIds,
+            );
+          } catch (_) {
+            // The next refresh can reconcile notification read state.
+          }
+        }());
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _notifications = visibleNotifications;
+        _errorText = null;
+      });
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _errorText = error.message;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _errorText = 'Unable to load notifications right now.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      backgroundColor: AppColors.background,
+      appBar: AppBar(
+        title: const Text('Notifications'),
+        actions: [
+          IconButton(
+            onPressed: _isLoading
+                ? null
+                : () => _loadNotifications(showLoader: true),
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: _isLoading
+            ? const Center(child: CircularProgressIndicator())
+            : RefreshIndicator(
+                onRefresh: () => _loadNotifications(),
+                child: ListView(
+                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
+                  children: [
+                    if (_errorText != null) ...[
+                      _InlineInfoCard(
+                        backgroundColor: const Color(0xFFFFF0F0),
+                        icon: Icons.error_outline_rounded,
+                        iconColor: const Color(0xFFC73B3B),
+                        title: 'Notifications unavailable',
+                        subtitle: _errorText!,
+                      ),
+                      const SizedBox(height: 14),
+                    ],
+                    if (_notifications.isEmpty)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 22,
+                          vertical: 36,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(28),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x12000000),
+                              blurRadius: 16,
+                              offset: Offset(0, 8),
+                            ),
+                          ],
+                        ),
+                        child: Column(
+                          children: [
+                            Container(
+                              width: 72,
+                              height: 72,
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: AppColors.primarySoft,
+                              ),
+                              child: const Icon(
+                                Icons.notifications_none_rounded,
+                                color: AppColors.primary,
+                                size: 34,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            Text(
+                              'No notifications yet',
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                color: AppColors.text,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Admin notifications sent to you will appear here.',
+                              textAlign: TextAlign.center,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: AppColors.subtleText,
+                                height: 1.45,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    else
+                      ..._notifications.map(
+                        (notification) => Padding(
+                          padding: const EdgeInsets.only(bottom: 14),
+                          child: _NotificationCard(notification: notification),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+      ),
+    );
+  }
+}
+
+class _NotificationCard extends StatelessWidget {
+  const _NotificationCard({required this.notification});
+
+  final EmployeePushNotification notification;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isUnread = !notification.isRead;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: isUnread ? AppColors.primary : const Color(0xFFE8E1EF),
+          width: isUnread ? 1.4 : 1,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: isUnread ? const Color(0x24C62828) : const Color(0x10000000),
+            blurRadius: isUnread ? 22 : 12,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.all(18),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 46,
+            height: 46,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: isUnread ? AppColors.primarySoft : AppColors.surfaceTint,
+            ),
+            child: Icon(
+              isUnread
+                  ? Icons.notifications_active_rounded
+                  : Icons.notifications_none_rounded,
+              color: isUnread ? AppColors.primary : AppColors.secondary,
+            ),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        notification.title.trim().isEmpty
+                            ? 'Attica Pagar'
+                            : notification.title.trim(),
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          color: AppColors.text,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    if (isUnread)
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: const BoxDecoration(
+                          color: Color(0xFFE5446D),
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  notification.body.trim().isEmpty
+                      ? 'No message content.'
+                      : notification.body.trim(),
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: AppColors.text,
+                    height: 1.45,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  _formatNotificationSentAt(notification.sentAt),
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: AppColors.subtleText,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -5800,11 +8885,12 @@ class _FrontCameraCapturePageState extends State<FrontCameraCapturePage> {
 
     try {
       final image = await controller.takePicture();
+      final normalizedFile = await _normalizeCapturedImage(File(image.path));
       if (!mounted) {
         return;
       }
 
-      Navigator.of(context).pop(File(image.path));
+      Navigator.of(context).pop(normalizedFile);
     } on CameraException catch (error) {
       if (!mounted) {
         return;
@@ -5827,6 +8913,23 @@ class _FrontCameraCapturePageState extends State<FrontCameraCapturePage> {
           _isCapturing = false;
         });
       }
+    }
+  }
+
+  Future<File> _normalizeCapturedImage(File imageFile) async {
+    try {
+      final bytes = await imageFile.readAsBytes();
+      final decodedImage = img.decodeImage(bytes);
+      if (decodedImage == null) {
+        return imageFile;
+      }
+
+      final bakedImage = img.bakeOrientation(decodedImage);
+      final encodedBytes = img.encodeJpg(bakedImage, quality: 92);
+      await imageFile.writeAsBytes(encodedBytes, flush: true);
+      return imageFile;
+    } catch (_) {
+      return imageFile;
     }
   }
 
@@ -6055,6 +9158,8 @@ class DashboardShortcut {
     required this.icon,
     required this.highlight,
     this.enabled = true,
+    this.glow = false,
+    this.badgeCount = 0,
     this.onTap,
   });
 
@@ -6062,6 +9167,8 @@ class DashboardShortcut {
   final IconData icon;
   final bool highlight;
   final bool enabled;
+  final bool glow;
+  final int badgeCount;
   final VoidCallback? onTap;
 }
 
@@ -6980,6 +10087,123 @@ class _LabeledField extends StatelessWidget {
   }
 }
 
+class _BirthdayBurstOverlay extends StatelessWidget {
+  const _BirthdayBurstOverlay();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 1700),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        final clamped = value.clamp(0.0, 1.0);
+        final fadeOut = 1 - ((clamped - 0.6) / 0.4).clamp(0.0, 1.0);
+
+        Widget burstIcon({
+          required double left,
+          required double topStart,
+          required double topTravel,
+          required double rotationTurns,
+          required IconData icon,
+          required Color color,
+          required double size,
+        }) {
+          return Positioned(
+            left: left,
+            top: topStart + (topTravel * clamped),
+            child: Opacity(
+              opacity: fadeOut,
+              child: Transform.rotate(
+                angle: rotationTurns * 6.28318 * clamped,
+                child: Icon(icon, color: color, size: size),
+              ),
+            ),
+          );
+        }
+
+        return Stack(
+          children: [
+            burstIcon(
+              left: 18,
+              topStart: 12,
+              topTravel: 126,
+              rotationTurns: -0.2,
+              icon: Icons.celebration_rounded,
+              color: const Color(0xFFFF7A59),
+              size: 30,
+            ),
+            burstIcon(
+              left: 54,
+              topStart: 26,
+              topTravel: 152,
+              rotationTurns: 0.3,
+              icon: Icons.auto_awesome,
+              color: const Color(0xFFFFC247),
+              size: 18,
+            ),
+            burstIcon(
+              left: 96,
+              topStart: 18,
+              topTravel: 172,
+              rotationTurns: -0.4,
+              icon: Icons.stars_rounded,
+              color: const Color(0xFFFF5D8F),
+              size: 20,
+            ),
+            burstIcon(
+              left: MediaQuery.of(context).size.width - 50,
+              topStart: 16,
+              topTravel: 134,
+              rotationTurns: 0.25,
+              icon: Icons.celebration_rounded,
+              color: const Color(0xFF6F40D8),
+              size: 30,
+            ),
+            burstIcon(
+              left: MediaQuery.of(context).size.width - 88,
+              topStart: 32,
+              topTravel: 166,
+              rotationTurns: -0.28,
+              icon: Icons.auto_awesome,
+              color: const Color(0xFFFFD35F),
+              size: 18,
+            ),
+            burstIcon(
+              left: MediaQuery.of(context).size.width - 126,
+              topStart: 24,
+              topTravel: 184,
+              rotationTurns: 0.42,
+              icon: Icons.stars_rounded,
+              color: const Color(0xFFFF7B7B),
+              size: 20,
+            ),
+            Positioned(
+              top: 102 + (18 * clamped),
+              left: 20,
+              right: 20,
+              child: Opacity(
+                opacity: (0.92 * fadeOut).clamp(0.0, 1.0),
+                child: Text(
+                  'Celebrate your day',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    color: const Color(0x80FFFFFF),
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 0.2,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 class _ShortcutCard extends StatelessWidget {
   const _ShortcutCard({required this.item});
 
@@ -6995,36 +10219,90 @@ class _ShortcutCard extends StatelessWidget {
         decoration: BoxDecoration(
           color: item.enabled ? Colors.white : const Color(0xFFF1EEF6),
           borderRadius: BorderRadius.circular(24),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x12000000),
-              blurRadius: 16,
-              offset: Offset(0, 8),
-            ),
-          ],
+          boxShadow: item.glow
+              ? const [
+                  BoxShadow(
+                    color: Color(0x55C62828),
+                    blurRadius: 28,
+                    spreadRadius: 1,
+                    offset: Offset(0, 12),
+                  ),
+                  BoxShadow(
+                    color: Color(0x24E2B94E),
+                    blurRadius: 18,
+                    spreadRadius: 2,
+                  ),
+                ]
+              : const [
+                  BoxShadow(
+                    color: Color(0x12000000),
+                    blurRadius: 16,
+                    offset: Offset(0, 8),
+                  ),
+                ],
         ),
         padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
         child: Row(
           children: [
-            Container(
-              width: 52,
-              height: 52,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: item.enabled
-                    ? item.highlight
-                          ? AppColors.primarySoft
-                          : AppColors.surfaceTint
-                    : const Color(0xFFE7E1EE),
-              ),
-              child: Icon(
-                item.icon,
-                color: item.enabled
-                    ? item.highlight
-                          ? AppColors.primary
-                          : AppColors.secondary
-                    : AppColors.secondary,
-              ),
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: item.enabled
+                        ? item.highlight
+                              ? AppColors.primarySoft
+                              : AppColors.surfaceTint
+                        : const Color(0xFFE7E1EE),
+                    boxShadow: item.glow
+                        ? const [
+                            BoxShadow(
+                              color: Color(0x66D4A017),
+                              blurRadius: 18,
+                              spreadRadius: 2,
+                            ),
+                          ]
+                        : null,
+                  ),
+                  child: Icon(
+                    item.icon,
+                    color: item.enabled
+                        ? item.highlight
+                              ? AppColors.primary
+                              : AppColors.secondary
+                        : AppColors.secondary,
+                  ),
+                ),
+                if (item.badgeCount > 0)
+                  Positioned(
+                    top: -5,
+                    right: -5,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE5446D),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(color: Colors.white, width: 2),
+                      ),
+                      child: Text(
+                        item.badgeCount > 99
+                            ? '99+'
+                            : item.badgeCount.toString(),
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w900,
+                          height: 1,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
             const SizedBox(width: 16),
             Expanded(
@@ -7266,6 +10544,15 @@ String _formatAppliedAt(String value) {
   return '${_formatIsoDate(parsed.toIso8601String())} at ${hour.toString().padLeft(2, '0')}:$minute$meridiem';
 }
 
+String _formatNotificationSentAt(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return 'Recently';
+  }
+
+  return _formatAppliedAt(trimmed);
+}
+
 Color _requestStatusColor(String status) {
   switch (status.trim().toLowerCase()) {
     case 'approved':
@@ -7285,6 +10572,10 @@ String _requestStatusLabel(String status) {
   }
 
   return '${trimmed[0].toUpperCase()}${trimmed.substring(1)}';
+}
+
+bool _isTeDesignation(String value) {
+  return value.trim().toUpperCase() == 'TE';
 }
 
 DateTime? _parseAttendanceTime(String? value) {
@@ -7311,15 +10602,45 @@ DateTime? _parseAttendanceTime(String? value) {
   return DateTime(2000, 1, 1, hour, minute, second);
 }
 
+DateTime? _parseAttendanceDateTime(String? date, String? time) {
+  final parsedTime = _parseAttendanceTime(time);
+  final trimmedDate = date?.trim() ?? '';
+
+  if (trimmedDate.isEmpty || parsedTime == null) {
+    return null;
+  }
+
+  final parsedDate = DateTime.tryParse(trimmedDate);
+
+  if (parsedDate == null) {
+    return null;
+  }
+
+  return DateTime(
+    parsedDate.year,
+    parsedDate.month,
+    parsedDate.day,
+    parsedTime.hour,
+    parsedTime.minute,
+    parsedTime.second,
+  );
+}
+
+bool _parseBool(dynamic value) {
+  final normalized = value?.toString().trim().toLowerCase() ?? '';
+
+  return normalized == '1' || normalized == 'true' || normalized == 'yes';
+}
+
 String _resolveAssetUrl(String path) {
-  final trimmed = path.trim();
+  final trimmed = _withPublicAssetSegment(path).trim();
   if (trimmed.isEmpty) {
     return '';
   }
 
   final parsed = Uri.tryParse(trimmed);
   if (parsed != null && parsed.hasScheme) {
-    return trimmed;
+    return _normalizeAssetCandidate(trimmed);
   }
 
   final apiUri = Uri.parse(ApiConfig.baseUrl);
@@ -7331,7 +10652,64 @@ String _resolveAssetUrl(String path) {
   final baseUri = apiUri.replace(pathSegments: segments);
   final relativePath = trimmed.startsWith('/') ? trimmed.substring(1) : trimmed;
 
-  return baseUri.resolve(relativePath).toString();
+  return _normalizeAssetCandidate(baseUri.resolve(relativePath).toString());
+}
+
+DateTime? _parseYmdDate(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return null;
+  }
+
+  final parts = trimmed.split('-');
+  if (parts.length != 3) {
+    return null;
+  }
+
+  final year = int.tryParse(parts[0]);
+  final month = int.tryParse(parts[1]);
+  final day = int.tryParse(parts[2]);
+
+  if (year == null || month == null || day == null) {
+    return null;
+  }
+
+  return DateTime(year, month, day);
+}
+
+String _formatApiDate(DateTime? date) {
+  if (date == null) {
+    return '';
+  }
+
+  final year = date.year.toString().padLeft(4, '0');
+  final month = date.month.toString().padLeft(2, '0');
+  final day = date.day.toString().padLeft(2, '0');
+
+  return '$year-$month-$day';
+}
+
+String _formatDisplayDate(DateTime? date) {
+  if (date == null) {
+    return '';
+  }
+
+  const monthNames = <String>[
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ];
+
+  return '${date.day.toString().padLeft(2, '0')} ${monthNames[date.month - 1]} ${date.year}';
 }
 
 List<String> _resolveAssetUrls({
@@ -7341,7 +10719,7 @@ List<String> _resolveAssetUrls({
   final urls = <String>[];
 
   void addCandidate(String value) {
-    final trimmed = value.trim();
+    final trimmed = _normalizeAssetCandidate(value);
     if (trimmed.isEmpty || urls.contains(trimmed)) {
       return;
     }
@@ -7349,10 +10727,8 @@ List<String> _resolveAssetUrls({
     urls.add(trimmed);
   }
 
-  addCandidate(photoUrl);
   addCandidate(_resolveAssetUrl(photoPath));
   addCandidate(_withPublicAssetSegment(photoUrl));
-  addCandidate(_resolveAssetUrl(_withPublicAssetSegment(photoPath)));
 
   return urls;
 }
@@ -7382,6 +10758,94 @@ String _withPublicAssetSegment(String value) {
   }
 
   return trimmed.startsWith('storage/') ? 'public/$trimmed' : trimmed;
+}
+
+String _normalizeAssetCandidate(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return '';
+  }
+
+  final parsed = Uri.tryParse(trimmed);
+  if (parsed == null) {
+    return trimmed;
+  }
+
+  if (!parsed.hasScheme) {
+    return trimmed;
+  }
+
+  final apiUri = Uri.parse(ApiConfig.baseUrl);
+  final pathSegments = List<String>.from(parsed.pathSegments);
+
+  final needsHostRewrite = _shouldRewriteAssetHost(
+    candidateUri: parsed,
+    apiUri: apiUri,
+  );
+
+  final normalizedUri = parsed.replace(
+    scheme: needsHostRewrite ? apiUri.scheme : parsed.scheme,
+    host: needsHostRewrite ? apiUri.host : parsed.host,
+    port: needsHostRewrite
+        ? apiUri.port
+        : parsed.hasPort
+        ? parsed.port
+        : null,
+    pathSegments: pathSegments,
+  );
+
+  return normalizedUri.toString();
+}
+
+bool _shouldRewriteAssetHost({required Uri candidateUri, required Uri apiUri}) {
+  final host = candidateUri.host.trim().toLowerCase();
+  if (host.isEmpty) {
+    return false;
+  }
+
+  if (host == '127.0.0.1' || host == 'localhost' || host == '10.0.2.2') {
+    return true;
+  }
+
+  if (_isPrivateIpv4Host(host)) {
+    return true;
+  }
+
+  if (host.endsWith('.local')) {
+    return true;
+  }
+
+  return false;
+}
+
+bool _isPrivateIpv4Host(String host) {
+  final parts = host.split('.');
+  if (parts.length != 4) {
+    return false;
+  }
+
+  final octets = <int>[];
+  for (final part in parts) {
+    final value = int.tryParse(part);
+    if (value == null || value < 0 || value > 255) {
+      return false;
+    }
+    octets.add(value);
+  }
+
+  if (octets[0] == 10) {
+    return true;
+  }
+
+  if (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) {
+    return true;
+  }
+
+  if (octets[0] == 192 && octets[1] == 168) {
+    return true;
+  }
+
+  return false;
 }
 
 bool _samePhotoUrls(List<String> first, List<String> second) {

@@ -1,4 +1,4 @@
-package com.example.frontend
+package app.abhibs.locatoremployee
 
 import android.content.Intent
 import android.provider.Settings
@@ -8,7 +8,7 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     companion object {
-        private const val LOCATION_INTEGRITY_CHANNEL = "com.example.frontend/location_integrity"
+        private const val LOCATION_INTEGRITY_CHANNEL = "app.abhibs.locatoremployee/location_integrity"
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
