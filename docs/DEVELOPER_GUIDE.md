@@ -107,6 +107,10 @@ POST actions redirect back to their owning page. Keep this separation when exten
 
 Existing custom sidebar permissions containing `salary.advance` are expanded at runtime to the two new advance menu keys for backward compatibility. Accounts-role defaults explicitly include all three.
 
+The sidebar uses exact route matching for the three advance pages so the shared `admin-salary-advance` prefix cannot activate **Add Advance Details** while **Advance Requests** or **Import Advance** is open. Advance-history routes intentionally activate **Add Advance Details**.
+
+Account Details accepts a normalized `status` query filter of `active` or `inactive`. Active means the employee status is null or is not `inactive` after trimming/case normalization; inactive means it equals `inactive`. The same filter pipeline supplies the HTML page and Excel export, so exports preserve the selected status together with name, branch, and state.
+
 Backend validation commands:
 
 ```powershell
@@ -250,5 +254,6 @@ Reviewers should reject changes whose documentation no longer matches implementa
 
 ## Documentation change log
 
+- 2026-08-01 — Version 5.0.22+5023 — Documented exact advance-menu route matching and Account Details status filtering/export behavior.
 - 2026-08-01 — Version 5.0.22+5023 — Documented the split Salary advance routes, query isolation, sidebar compatibility, performance behavior, redirects, and backend validation blocker.
 - 2026-08-01 — Version 5.0.22+5023 — Created the end-to-end developer and publication guide.

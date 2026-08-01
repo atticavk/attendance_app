@@ -91,7 +91,9 @@ Authorized HR/accounts administrators now use three separate entries under **Sal
 - **Advance Requests:** filter requests from the employee app, download the request spreadsheet, select multiple requests for approval/rejection, or review and act on one request with an optional note.
 - **Add Advance Details:** review employee advance totals and manually add a dated advance entry. Use **View Details** to inspect an employee's ledger.
 
-The pages are separate so opening or submitting one workflow does not wait for the other two data sets to load. After an action, the administrator remains on the relevant page.
+The pages are separate so opening or submitting one workflow does not wait for the other two data sets to load. After an action, the administrator remains on the relevant page. The sidebar highlights only the advance page currently open; employee advance history remains associated with **Add Advance Details**.
+
+On **Salary > Account Details**, use **Employee Status** to show all employees, only active employees, or only inactive employees. The selected status combines with branch, state, and employee-name filters and is also applied to **Download Excel**.
 
 ## Sign out
 
@@ -132,5 +134,6 @@ The app processes identity, attendance, location, photographs, notification devi
 
 ## Documentation change log
 
+- 2026-08-01 — Version 5.0.22+5023 — Documented exact advance sidebar highlighting and the Account Details active/inactive employee filter.
 - 2026-08-01 — Version 5.0.22+5023 — Documented the three separate Salary advance administration pages and their faster independent loading.
 - 2026-08-01 — Version 5.0.22+5023 — Created the end-to-end user guide.
