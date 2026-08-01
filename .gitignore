@@ -33,6 +33,14 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Local Gradle caches
+/.gradle-local/
+/.gradle-user-home/
+/android/.gradle-user-home/
+
+# Local emulator captures
+/emulator-*.png
+
 # Symbolication related
 app.*.symbols
 

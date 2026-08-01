@@ -2,6 +2,7 @@ package app.abhibs.locatoremployee
 
 import android.content.Intent
 import android.provider.Settings
+import android.content.ActivityNotFoundException
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -23,6 +24,14 @@ class MainActivity : FlutterActivity() {
                     openDeveloperSettings()
                     result.success(null)
                 }
+                "openLocationSettings" -> {
+                    openLocationSettings()
+                    result.success(null)
+                }
+                "openWirelessSettings" -> {
+                    openWirelessSettings()
+                    result.success(null)
+                }
 
                 else -> result.notImplemented()
             }
@@ -31,6 +40,35 @@ class MainActivity : FlutterActivity() {
 
     private fun openDeveloperSettings() {
         val intent = Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+    }
+
+    private fun openLocationSettings() {
+        val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            openGeneralSettings()
+        }
+    }
+
+    private fun openWirelessSettings() {
+        val intent = Intent(Settings.ACTION_WIRELESS_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            openGeneralSettings()
+        }
+    }
+
+    private fun openGeneralSettings() {
+        val intent = Intent(Settings.ACTION_SETTINGS).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         startActivity(intent)
