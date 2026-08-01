@@ -1,17 +1,22 @@
-# frontend
+# Attica Attendance
 
-A new Flutter project.
+Flutter employee attendance and services application for Android, web, and supported desktop targets.
 
-## Getting Started
+## Documentation
 
-This project is a starting point for a Flutter application.
+- [User guide](docs/USER_GUIDE.md): installation, sign-in, attendance, employee workflows, permissions, troubleshooting, privacy, and support.
+- [Developer and publication guide](docs/DEVELOPER_GUIDE.md): setup, architecture, configuration, testing, signing, publication, verification, rollback, and maintenance.
+- [Repository instructions](AGENTS.md): mandatory documentation updates for every change.
 
-A few resources to get you started if this is your first Flutter project:
+Current application version: `5.0.22+5023`.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+## Quick start
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+```powershell
+flutter pub get
+flutter analyze --no-pub
+flutter test
+flutter run
+```
+
+Read the developer guide before configuring production services or creating a release.
