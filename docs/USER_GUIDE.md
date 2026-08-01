@@ -83,6 +83,16 @@ If notifications are missing, enable the app's notification channels, permit exa
 - **ID Card:** view eligibility/status and submit required information or images.
 - **Profile:** review supported personal information, update a photograph or fields, change password, and submit enabled bank/UAN changes. Some updates require administrative approval.
 
+## Salary administration
+
+Authorized HR/accounts administrators now use three separate entries under **Salary**:
+
+- **Import Advance:** upload CSV/XLS/XLSX advance files, review skipped rows, and confirm or cancel conflicts with manual entries.
+- **Advance Requests:** filter requests from the employee app, download the request spreadsheet, select multiple requests for approval/rejection, or review and act on one request with an optional note.
+- **Add Advance Details:** review employee advance totals and manually add a dated advance entry. Use **View Details** to inspect an employee's ledger.
+
+The pages are separate so opening or submitting one workflow does not wait for the other two data sets to load. After an action, the administrator remains on the relevant page.
+
 ## Sign out
 
 Open the profile/account menu, select **Logout**, and confirm. Sign out on shared devices.
@@ -122,4 +132,5 @@ The app processes identity, attendance, location, photographs, notification devi
 
 ## Documentation change log
 
+- 2026-08-01 — Version 5.0.22+5023 — Documented the three separate Salary advance administration pages and their faster independent loading.
 - 2026-08-01 — Version 5.0.22+5023 — Created the end-to-end user guide.

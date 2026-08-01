@@ -24,6 +24,8 @@ This Flutter client provides authentication, employee profile/ID-card/bank/UAN w
 | `test/` | Flutter tests |
 | `docs/` | User and developer documentation |
 
+The Laravel admin backend is maintained in the sibling `Backend/` directory. Salary advance administration is handled by `SalaryController`, `AdminMenu`, `routes/admin.php`, and `resources/views/admin/salary/advance_details.blade.php`.
+
 Most domain and UI logic currently lives in `lib/main.dart`; keep changes focused and test adjacent workflows carefully.
 
 ## Prerequisites and setup
@@ -90,6 +92,34 @@ flutter build apk --debug
 Known baseline at guide creation: analysis reports two informational web-library notices in `lib/web_desktop_attendance_web.dart` and two test compile errors in `test/widget_test.dart` because its mocked login callback uses the old signature. Fix these before claiming a clean validation run.
 
 Test session changes across first login, remembered login, password setup, restore, logout, expiry, and upgrade. Test attendance changes across permission denial/recovery, offline behavior, location integrity, duplicate submission, early checkout, camera interruption, background location, and server rejection. Test notifications in foreground, background, terminated, after reboot, after token refresh, and after logout.
+
+### Salary advance admin pages
+
+The former combined admin advance screen is split into independently loaded routes:
+
+| Page | Route name | Data loaded |
+| --- | --- | --- |
+| Import Advance | `admin-salary-advance-import-page` | Import form and session-based import results/conflicts |
+| Advance Requests | `admin-salary-advance-requests` | Pending app requests and employee/bank details required for review |
+| Add Advance Details | `admin-salary-advance` | Active employees, detail records, ledger counts, and aggregate totals |
+
+POST actions redirect back to their owning page. Keep this separation when extending the module; do not reintroduce cross-page queries. The add-details query intentionally uses counts and SQL sums without eager-loading every historical transaction. Full history belongs on `admin-salary-advance-history`.
+
+Existing custom sidebar permissions containing `salary.advance` are expanded at runtime to the two new advance menu keys for backward compatibility. Accounts-role defaults explicitly include all three.
+
+Backend validation commands:
+
+```powershell
+Set-Location ..\Backend
+php -l app/Http/Controllers/Admin/SalaryController.php
+php -l app/Support/AdminMenu.php
+php -l routes/admin.php
+php artisan route:list --name=admin-salary-advance
+php artisan view:cache
+php artisan test --filter=Advance
+```
+
+Known backend baseline at this update: the filtered PHPUnit run stops before execution because `app/Support/AdvancePayrollWindow.php` declares `Tests\Unit\AdvancePayrollWindowTest`, colliding with the actual test class. Do not report the backend suite as passing until that class declaration issue is corrected.
 
 ## API and data safety
 
@@ -220,4 +250,5 @@ Reviewers should reject changes whose documentation no longer matches implementa
 
 ## Documentation change log
 
+- 2026-08-01 — Version 5.0.22+5023 — Documented the split Salary advance routes, query isolation, sidebar compatibility, performance behavior, redirects, and backend validation blocker.
 - 2026-08-01 — Version 5.0.22+5023 — Created the end-to-end developer and publication guide.
