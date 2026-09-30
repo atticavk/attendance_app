@@ -4,6 +4,7 @@
 !**/.env.example
 **/vendor/
 **/node_modules/
+**/.kotlin/
 **/error_log
 **/*.log
 **/*.zip
