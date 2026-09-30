@@ -1,53 +1,35 @@
-# Miscellaneous
-*.class
-*.log
-*.pyc
-*.swp
-.DS_Store
-.atom/
-.build/
-.buildlog/
-.history
-.svn/
-.swiftpm/
-migrate_working_dir/
-
-# IntelliJ related
-*.iml
-*.ipr
-*.iws
-.idea/
-
-# The .vscode folder contains launch configuration and tasks you configure in
-# VS Code which you may wish to be included in version control, so this line
-# is commented out by default.
-#.vscode/
-
-# Flutter/Dart/Pub related
-**/doc/api/
-**/ios/Flutter/.last_build_id
-.dart_tool/
-.flutter-plugins-dependencies
-.pub-cache/
-.pub/
-/build/
-/coverage/
-
-# Local Gradle caches
-/.gradle-local/
-/.gradle-user-home/
-/android/.gradle-user-home/
-
-# Local emulator captures
-/emulator-*.png
-
-# Symbolication related
-app.*.symbols
-
-# Obfuscation related
-app.*.map.json
-
-# Android Studio will place build artifacts here
-/android/app/debug
-/android/app/profile
-/android/app/release
+# Local configuration, credentials and generated output
+**/.env
+**/.env.*
+!**/.env.example
+**/vendor/
+**/node_modules/
+**/error_log
+**/*.log
+**/*.zip
+**/*.apk
+**/*.aab
+**/*.jks
+**/*.keystore
+**/key.properties
+**/service-account*.json
+**/.phpunit.cache/
+**/.phpunit.result.cache
+**/storage/app/private/*
+!**/storage/app/private/.gitignore
+**/storage/app/firebase/*
+Backend/public/EmployeeDocuments/
+Backend/public/downloads/
+Backend/public/storage
+Backend/storage/id-cards/
+Backend/build/
+Backend/production-artifacts/
+frontend/android/app/google-services.json
+frontend/ios/Runner/GoogleService-Info.plist
+frontend/*screen*.png
+frontend/emulator-*.png
+frontend/attica_screen.png
+.local/
+.worktrees/
+*.sql
+!Backend/database/schema/*.sql

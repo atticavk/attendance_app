@@ -1,0 +1,6 @@
+{
+    "effectiveFromMonth": "2026-05",
+    "defaultPfAmount": 1800,
+    "activeMembersFile": "storage/app/private/active-members.csv",
+    "employees": []
+}

@@ -1,0 +1,31 @@
+{
+  "id": "../admin/",
+  "name": "Attica Pagar Admin",
+  "short_name": "Attica",
+  "description": "Attica attendance and administration portal",
+  "start_url": "../admin/dashboard",
+  "scope": "../admin/",
+  "display": "standalone",
+  "background_color": "#760107",
+  "theme_color": "#760107",
+  "icons": [
+    {
+      "src": "admin/assets/images/attica-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "admin/assets/images/attica-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "admin/assets/images/attica-icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

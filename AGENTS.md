@@ -1,16 +1,11 @@
-# Repository instructions
+# Android Project 3 documentation rule
 
-These instructions apply to the entire Flutter repository.
+These instructions apply to the whole project, including `Backend` and `frontend`.
 
-## Documentation is part of every change
+Every code, configuration, dependency, asset, database, build, deployment, or behavior change must update the maintained documentation in the same change:
 
-Every code, configuration, dependency, asset, build, deployment, or behavior change must update documentation in the same commit.
-
-- Update `docs/USER_GUIDE.md` for user-visible workflows, requirements, permissions, messages, or troubleshooting.
-- Update `docs/DEVELOPER_GUIDE.md` for architecture, setup, configuration, APIs, dependencies, tests, builds, security, deployment, or operations.
-- Update both for cross-cutting changes.
-- Add a dated entry to each affected guide's `Documentation change log`.
-- If there is genuinely no documentation impact, put `Documentation impact: none` and the reason in the commit or pull-request description.
-- Never document passwords, tokens, signing secrets, private keys, or personal data.
-
-Before completing a change, verify the guides match the implementation.
+- Update `frontend/docs/USER_GUIDE.md` for user/admin-visible workflows, requirements, permissions, messages, or troubleshooting.
+- Update `frontend/docs/DEVELOPER_GUIDE.md` for architecture, setup, routes/APIs, queries, dependencies, tests, builds, security, deployment, or operations.
+- Update both for cross-cutting changes and add a dated entry to each affected guide's documentation change log.
+- If there is genuinely no documentation impact, state `Documentation impact: none` and explain why in the commit or pull-request description.
+- Never add passwords, tokens, signing secrets, private keys, or personal data to documentation.
